@@ -21,12 +21,13 @@ namespace
 {
 static constexpr const char *kFileName = "/prefs/custom_led.bin";
 static constexpr uint32_t kMagic = 0x434C4544;
-static constexpr uint16_t kVersion = 8;
+static constexpr uint16_t kVersion = 9;
 static constexpr size_t kLegacySerializedSize = 94;
 static constexpr size_t kV5SerializedSize = 103;
 static constexpr size_t kV6SerializedSize = 113;
 static constexpr size_t kV7SerializedSize = 253;
-static constexpr size_t kSerializedSize = 273;
+static constexpr size_t kV8SerializedSize = 273;
+static constexpr size_t kSerializedSize = 274;
 static constexpr uint32_t kLocalReplyDelayMs = 0;
 static constexpr uint32_t kLocalReplyTimestampOffsetSecs = 1;
 static constexpr uint32_t kLocalLedCommandBotNode = 0x4C454421; // !4C454421, "LED!"
@@ -134,6 +135,159 @@ class LocalLedReplyDispatcher : private concurrency::OSThread
     PendingReply pending[kQueueSize];
 };
 
+// Cheap HSV(hue, 1, 1)->RGB for building a legacy-compatible rainbow step list. Intentionally
+// separate from HeartbeatPixelThread's own hsvToRgb: that one renders locally every 25ms and lives
+// on a private class; this one runs a handful of times when a remote animation is scheduled.
+uint32_t hueToHex(float hue)
+{
+    const float h6 = (hue - floorf(hue)) * 6.0f;
+    const int sector = (int)h6;
+    const float f = h6 - (float)sector;
+    const uint8_t rise = (uint8_t)roundf(f * 255.0f);
+    const uint8_t fall = (uint8_t)roundf((1.0f - f) * 255.0f);
+    uint8_t r = 255, g = rise, b = 0;
+    switch (sector) {
+    case 1:
+        r = fall; g = 255; b = 0;
+        break;
+    case 2:
+        r = 0; g = 255; b = rise;
+        break;
+    case 3:
+        r = 0; g = fall; b = 255;
+        break;
+    case 4:
+        r = rise; g = 0; b = 255;
+        break;
+    case 5:
+        r = 255; g = 0; b = fall;
+        break;
+    default:
+        break;
+    }
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+// Plays a visible effect on a DM peer using nothing but ordinary "#! set default color" commands,
+// sent a few seconds apart, so it works even against a peer running unmodified upstream firmware
+// that has no idea what a "gift" or LED pattern is. Necessarily leaves the peer's default color
+// changed afterward (there is no over-the-air way to read back and later restore their prior
+// color), so each sequence intentionally lands on the firmware's documented default blue/red.
+class RemoteAnimatorThread : private concurrency::OSThread
+{
+  public:
+    RemoteAnimatorThread() : concurrency::OSThread("RemoteAnimator", UINT32_MAX) { enabled = false; }
+
+    bool startRainbow(uint32_t targetNode, uint8_t channelIndex)
+    {
+        if (enabled) {
+            return false;
+        }
+        stepCount = 0;
+        for (uint8_t i = 0; i < kRainbowSteps && stepCount < kMaxSteps - 1; ++i) {
+            const float hue1 = (float)i / (float)kRainbowSteps;
+            // Complementary (opposite side of the color wheel) so the badge's two LED halves read
+            // as a distinct two-tone combo each step, instead of a single flat color.
+            const uint32_t color1 = hueToHex(hue1);
+            const uint32_t color2 = hueToHex(hue1 + 0.5f);
+            snprintf(steps[stepCount], sizeof(steps[stepCount]), "#! set default color #%06X #%06X", (unsigned int)color1,
+                     (unsigned int)color2);
+            stepCount++;
+        }
+        appendLandingStep();
+        return start(targetNode, channelIndex);
+    }
+
+    bool startBlink(uint32_t targetNode, uint8_t channelIndex, uint32_t color)
+    {
+        if (enabled) {
+            return false;
+        }
+        stepCount = 0;
+        for (uint8_t i = 0; i < kBlinkSteps && stepCount < kMaxSteps - 1; ++i) {
+            const uint32_t stepColor = (i % 2 == 0) ? (color & 0xFFFFFF) : 0x000000;
+            snprintf(steps[stepCount], sizeof(steps[stepCount]), "#! set default color #%06X", (unsigned int)stepColor);
+            stepCount++;
+        }
+        appendLandingStep();
+        return start(targetNode, channelIndex);
+    }
+
+  protected:
+    int32_t runOnce() override
+    {
+        if (nextStep >= stepCount) {
+            enabled = false;
+            return disable();
+        }
+        sendStep(steps[nextStep]);
+        nextStep++;
+        if (nextStep >= stepCount) {
+            enabled = false;
+            return disable();
+        }
+        return (int32_t)kStepIntervalMs;
+    }
+
+  private:
+    static constexpr uint8_t kRainbowSteps = 12;
+    static constexpr uint8_t kBlinkSteps = 6;
+    static constexpr uint8_t kMaxSteps = kRainbowSteps + 1;
+    // Long enough that each color is clearly visible after the ~750ms green command-ack flash
+    // that every "#! set default color" step triggers on the receiving badge.
+    static constexpr uint32_t kStepIntervalMs = 10000;
+    static constexpr uint32_t kStartDelayMs = 200;
+
+    void appendLandingStep()
+    {
+        if (stepCount < kMaxSteps) {
+            snprintf(steps[stepCount], sizeof(steps[stepCount]), "#! set default color #0000FF #FF0000");
+            stepCount++;
+        }
+    }
+
+    bool start(uint32_t targetNode, uint8_t channelIndex)
+    {
+        target = targetNode;
+        channel = channelIndex;
+        nextStep = 0;
+        enabled = true;
+        setIntervalFromNow(kStartDelayMs);
+        return true;
+    }
+
+    void sendStep(const char *text)
+    {
+        if (!router) {
+            return;
+        }
+        meshtastic_MeshPacket *p = router->allocForSending();
+        if (!p) {
+            return;
+        }
+        p->to = target;
+        p->channel = channel;
+        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+        size_t length = strlen(text);
+        if (length > sizeof(p->decoded.payload.bytes)) {
+            length = sizeof(p->decoded.payload.bytes);
+        }
+        p->decoded.payload.size = length;
+        memcpy(p->decoded.payload.bytes, text, length);
+        if (service) {
+            service->sendToMesh(p);
+        } else {
+            packetPool.release(p);
+        }
+    }
+
+    uint32_t target = 0;
+    uint8_t channel = 0;
+    char steps[kMaxSteps][40] = {};
+    uint8_t stepCount = 0;
+    uint8_t nextStep = 0;
+};
+
 bool hasAnyChannelOverrides(const CustomLedConfig &config)
 {
     for (size_t i = 0; i < 8; ++i) {
@@ -208,6 +362,7 @@ bool readUint32(const uint8_t *buffer, size_t length, size_t &offset, uint32_t *
 
 LocalLedConfigStore *localLedConfigStore = nullptr;
 static LocalLedReplyDispatcher *localLedReplyDispatcher = nullptr;
+static RemoteAnimatorThread *remoteAnimatorThread = nullptr;
 
 LocalLedConfigStore::LocalLedConfigStore() : activeChannel(channels.getPrimaryIndex())
 {
@@ -226,6 +381,7 @@ void LocalLedConfigStore::applyDefaults(CustomLedConfig *defaults)
     defaults->idle_delay_ms = 0;
     defaults->notification_pulses = kLocalLedDefaultNotificationPulses;
     defaults->send_pulses = kLocalLedDefaultSendPulses;
+    defaults->node_pattern = LED_PATTERN_SOLID;
     for (size_t i = 0; i < 8; ++i) {
         defaults->channels[i].led1_color = 0;
         defaults->channels[i].led2_color = 0;
@@ -284,6 +440,7 @@ bool LocalLedConfigStore::serializeConfig(const CustomLedConfig &source, uint8_t
         buffer[offset++] = source.direct_message_users[i].send_pulses;
         buffer[offset++] = source.direct_message_users[i].configured ? 1 : 0;
     }
+    buffer[offset++] = source.node_pattern;
 
     if (usedBytes) {
         *usedBytes = offset;
@@ -307,7 +464,8 @@ bool LocalLedConfigStore::deserializeConfig(const uint8_t *buffer, size_t length
     }
     if (magic != kMagic || channelCount != 8 || (version < 1 || version > kVersion) ||
         (version >= 5 && length < kV5SerializedSize) || (version >= 6 && length < kV6SerializedSize) ||
-        (version >= 7 && length < kV7SerializedSize) || (version >= 8 && length < kSerializedSize)) {
+        (version >= 7 && length < kV7SerializedSize) || (version >= 8 && length < kV8SerializedSize) ||
+        (version >= 9 && length < kSerializedSize)) {
         return false;
     }
 
@@ -391,10 +549,16 @@ bool LocalLedConfigStore::deserializeConfig(const uint8_t *buffer, size_t length
             }
         }
     }
+    if (version >= 9) {
+        if (offset >= length) {
+            return false;
+        }
+        decoded.node_pattern = buffer[offset++];
+    }
 
     if (decoded.idle_bpm < 1 || decoded.idle_bpm > 600 || decoded.idle_delay_ms > 600000 ||
         decoded.notification_pulses < 1 || decoded.notification_pulses > kLocalLedMaxNotificationPulses ||
-        decoded.send_pulses < 1 || decoded.send_pulses > kLocalLedMaxNotificationPulses) {
+        decoded.send_pulses < 1 || decoded.send_pulses > kLocalLedMaxNotificationPulses || decoded.node_pattern > kLedPatternMax) {
         return false;
     }
     for (size_t i = 0; i < 8; ++i) {
@@ -531,9 +695,28 @@ bool LocalLedConfigStore::handleCommand(const char *text, const LocalLedCommandC
         save();
     }
 
+    // Resolved before the ack-flash decision below, since whether the animator actually accepted the
+    // job (it refuses a second job while one is still in flight) can only be known here, not by the
+    // transport-agnostic parser that produced the optimistic "OK" response text.
+    if (localResult.trigger_remote_animation && remoteAnimatorThread) {
+        const uint32_t animTarget = localResult.remote_animation_broadcast ? NODENUM_BROADCAST : localResult.remote_animation_target;
+        bool started;
+        if (localResult.remote_animation_kind == REMOTE_ANIM_BLINK) {
+            started = remoteAnimatorThread->startBlink(animTarget, localResult.remote_animation_channel,
+                                                        localResult.remote_animation_color);
+        } else {
+            started = remoteAnimatorThread->startRainbow(animTarget, localResult.remote_animation_channel);
+        }
+        if (!started) {
+            snprintf(localResult.response, sizeof(localResult.response), "ERR animation already in progress");
+        }
+    }
+
 #ifdef HAS_HEARTBEAT_NEOPIXELS
     if (heartbeatPixelThread) {
-        if (strncmp(localResult.response, "OK", 2) == 0) {
+        if (localResult.trigger_gift) {
+            heartbeatPixelThread->enqueueGiftPattern(localResult.gift_pattern, localResult.gift_color1, localResult.gift_color2);
+        } else if (strncmp(localResult.response, "OK", 2) == 0) {
             heartbeatPixelThread->enqueueCommandStatusPattern(true);
         } else if (strncmp(localResult.response, "ERR", 3) == 0) {
             heartbeatPixelThread->enqueueCommandStatusPattern(false);
@@ -585,6 +768,7 @@ LocalLedEffectiveConfig LocalLedConfigStore::getEffectiveConfigForChannel(uint8_
         snapshot.send_pulses,
         false,
         resolvedChannel,
+        LED_PATTERN_SOLID,
     };
     if (snapshot.channels[resolvedChannel].configured) {
         effective.led1_color = snapshot.channels[resolvedChannel].led1_color;
@@ -617,6 +801,7 @@ LocalLedEffectiveConfig LocalLedConfigStore::getEffectiveConfigForDirectMessage(
         snapshot.send_pulses,
         false,
         kLocalLedDirectMessageIndex,
+        LED_PATTERN_SOLID,
     };
     if (snapshot.direct_message.configured) {
         effective.led1_color = snapshot.direct_message.led1_color;
@@ -649,6 +834,7 @@ LocalLedEffectiveConfig LocalLedConfigStore::getEffectiveConfigForDirectMessage(
         snapshot.send_pulses,
         false,
         kLocalLedDirectMessageIndex,
+        LED_PATTERN_SOLID,
     };
     const ChannelLedConfig *dmConfig = snapshot.direct_message.configured ? &snapshot.direct_message : nullptr;
     int8_t userSlot = -1;
@@ -763,6 +949,9 @@ void setupLocalLedConfigStore()
     }
     if (!localLedReplyDispatcher) {
         localLedReplyDispatcher = new LocalLedReplyDispatcher();
+    }
+    if (!remoteAnimatorThread) {
+        remoteAnimatorThread = new RemoteAnimatorThread();
     }
     localLedConfigStore->load();
 }

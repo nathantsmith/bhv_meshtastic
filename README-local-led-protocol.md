@@ -16,7 +16,7 @@ The protocol is consumed by the node itself. It is not part of the stock Meshtas
 ## High-level behavior
 
 - Messages beginning with `#!` are intercepted and parsed locally.
-- Supported verbs are `set`, `get`, `clear`, and `help`.
+- Supported verbs are `set`, `get`, `clear`, and `help`, plus the standalone top-level commands `gift` and `animate` (see below).
 - Supported scopes are `default`, `ch`, and `dm`. `node` is accepted as a legacy alias for `default`.
 - Default settings are global fallbacks.
 - Channel settings are per-channel LED overrides.
@@ -447,6 +447,79 @@ OK ch=0 led cleared
 #! get ch
 ch=0 led led1=#0000FF led2=#FF0000 configured=false
 ```
+
+## LED patterns
+
+In addition to a solid color, the default (node-level, always-on) heartbeat can run one of several
+ambient patterns:
+
+- `solid` (default)
+- `rainbow` - hue cycles continuously
+- `sparkle` - random per-pixel flicker against the base color
+- `strobe` - fast on/off flash
+- `chase` - a lit pixel travels around the strip
+
+```text
+#! set default pattern <solid|rainbow|sparkle|strobe|chase>
+#! get default pattern
+```
+
+Like all `set default ...` commands, this is persisted and, when received over the air, applied to
+the *receiving* node - so it can be sent to another badge exactly like a color change. Patterns are
+currently only supported at the `default` scope; per-channel and per-DM overrides remain color-only.
+
+## Gift
+
+`gift` plays a one-time ~3 second animated LED burst on the *receiving* node without touching its
+saved configuration - unlike every other mutating command in this protocol, it is never persisted.
+
+```text
+#! gift <solid|rainbow|sparkle|strobe|chase> [c1] [c2]
+```
+
+Colors are optional. If omitted, the receiving node gifts itself its own currently configured
+colors in the requested pattern. `gift` requires both ends to be running this firmware; a peer on
+unmodified firmware will not recognize it (see Compatibility below).
+
+## Animate
+
+`animate` reproduces a `rainbow` or `blink` effect on a peer using nothing but a timed sequence of
+ordinary `set default color` commands - so, unlike `gift`, it works against a badge running
+unmodified upstream firmware, since the peer never needs to understand anything beyond the color
+command that already existed.
+
+```text
+#! animate rainbow            (must be sent inside a direct message; targets that peer)
+#! animate rainbow ch [n]     (opt-in broadcast to channel n, or the resolved/current channel)
+#! animate blink [color]
+#! animate blink ch [n] [color]
+```
+
+- `rainbow` steps through 12 complementary color pairs (`led1`/`led2` are set 180 degrees apart on
+  the color wheel) roughly one step every 10 seconds, then lands on the firmware's documented
+  default (`blue`/`red`).
+- `blink` alternates a chosen color (default white) with off for 6 steps, then lands the same way.
+- Broadcasting is opt-in only (`ch` must be typed explicitly) since it changes the default color on
+  every listening badge, not just one peer.
+- There is no over-the-air way to read back a peer's prior color, so `animate` cannot restore
+  whatever custom color a target had before running it - it always lands on the standard default.
+- Implementation: `RemoteAnimatorThread` in `LocalLedConfig.cpp`, which builds a short list of
+  legacy-compatible command strings and sends each as its own packet via `router->allocForSending()`
+  / `service->sendToMesh()`, spaced `kStepIntervalMs` apart. Only one animation can be in flight at a
+  time; a second `animate` while one is running returns `ERR animation already in progress`.
+
+## Compatibility with unmodified badges
+
+The `#!` transport has no version negotiation - only the literal text is sent over the air, and each
+node parses/acts on it with its own local copy of the command parser. Consequences:
+
+- `set default/ch/dm color`, `idle_bpm`, `idle_delay`, `notify_pulses`, `send_pulses`: understood by
+  any version of this protocol, including the pre-`pattern`/`gift`/`animate` firmware.
+- `pattern` and `gift`: require the receiving badge to also be running this change. Sent to an older
+  badge, they fall through to the existing `ERR unknown command` path, which is consumed silently
+  (no visible chat spam) but has no effect and produces no over-the-air reply.
+- `animate`: works against any badge, since it never sends its own name over the air - it only ever
+  transmits ordinary `set default color` commands the peer already understands.
 
 ## Implementation references
 
