@@ -92,8 +92,15 @@ int32_t HeartbeatPixelThread::runOnce()
             idleOff();
         }
     } else {
-        LocalLedEffectiveConfig effective = {
-            0x0000FF, 0xFF0000, 80, 0, kLocalLedDefaultNotificationPulses, kLocalLedDefaultSendPulses, false, 0};
+        LocalLedEffectiveConfig effective = {0x0000FF,
+                                             0xFF0000,
+                                             80,
+                                             0,
+                                             kLocalLedDefaultNotificationPulses,
+                                             kLocalLedDefaultSendPulses,
+                                             false,
+                                             0,
+                                             LED_PATTERN_SOLID};
         if (localLedConfigStore) {
             const CustomLedConfig cfg = localLedConfigStore->getConfig();
             effective.led1_color = cfg.node_led1_color;
@@ -102,6 +109,7 @@ int32_t HeartbeatPixelThread::runOnce()
             effective.idle_delay_ms = cfg.idle_delay_ms;
             effective.notification_pulses = cfg.notification_pulses;
             effective.send_pulses = cfg.send_pulses;
+            effective.pattern = cfg.node_pattern;
         }
         bool heartRateActive = false;
 #if !MESHTASTIC_EXCLUDE_HEALTH_TELEMETRY
@@ -189,8 +197,15 @@ void HeartbeatPixelThread::renderStartupFrame(uint32_t nowMs)
 {
     const double cycleTimeMs = (double)kStartupDurationMs;
     const double elapsedMs = (double)(nowMs - startupStartMs);
-    LocalLedEffectiveConfig startupEffective = {
-        0x0000FF, 0xFF0000, kStartupBpm, 0, kLocalLedDefaultNotificationPulses, kLocalLedDefaultSendPulses, true, 0};
+    LocalLedEffectiveConfig startupEffective = {0x0000FF,
+                                                0xFF0000,
+                                                kStartupBpm,
+                                                0,
+                                                kLocalLedDefaultNotificationPulses,
+                                                kLocalLedDefaultSendPulses,
+                                                true,
+                                                0,
+                                                LED_PATTERN_SOLID};
     hasNotificationProgress = false;
     applyFrame(cycleTimeMs, cycleTimeMs, elapsedMs, startupConfig, startupEffective);
 }
@@ -220,9 +235,13 @@ bool HeartbeatPixelThread::renderPatternFrame(uint32_t nowMs)
     const double elapsedMs = (double)(nowMs - pattern.startMs);
     const double durationMs = (double)pattern.durationMs;
     for (uint8_t i = 0; i < kLedCount; ++i) {
-        const float brightness =
-            calculateBrightness(durationMs, elapsedMs, pattern.config[i].startTime * durationMs, pattern.config[i].pulseWidth * durationMs);
-        setPixel(i, pattern.color, brightness);
+        const float envelopeBrightness = calculateBrightness(
+            durationMs, elapsedMs, pattern.config[i].startTime * durationMs, pattern.config[i].pulseWidth * durationMs);
+        RgbColor pixelColor = pattern.color;
+        float brightness = envelopeBrightness;
+        applyPatternPixel(pattern.patternType, i, pattern.color, pattern.color2, nowMs, pattern.startMs, envelopeBrightness,
+                          &pixelColor, &brightness);
+        setPixel(i, pixelColor, brightness);
     }
     showStrips();
     return true;
@@ -260,6 +279,7 @@ void HeartbeatPixelThread::applyFrame(double cycleTimeMs, double activeWindowMs,
         progressSnapshot = notificationProgress;
     }
 
+    const uint32_t patternNowMs = (uint32_t)currentTimeMs;
     for (uint8_t i = 0; i < kLedCount; ++i) {
         const float brightness =
             calculateBrightness(cycleTimeMs, currentTimeMs, config[i].startTime * activeWindowMs, config[i].pulseWidth * activeWindowMs);
@@ -270,9 +290,16 @@ void HeartbeatPixelThread::applyFrame(double cycleTimeMs, double activeWindowMs,
             pulseActive &&
             (usesLed1Color ? notificationAppliesToPixel(led1LaneSnapshot, i, progressSnapshot)
                            : notificationAppliesToPixel(led2LaneSnapshot, i, progressSnapshot));
-        const RgbColor &color =
+        RgbColor color =
             useNotificationColor ? (usesLed1Color ? led1LaneSnapshot.color : led2LaneSnapshot.color) : baseColor;
-        setPixel(i, color, (baseHeartbeatEnabled || useNotificationColor) ? brightness : 0.0f);
+        float finalBrightness = (baseHeartbeatEnabled || useNotificationColor) ? brightness : 0.0f;
+        // Notification flashes always show their configured solid color, unmodified, so incoming
+        // messages stay recognizable even when the ambient pattern is something like rainbow.
+        if (!useNotificationColor && baseHeartbeatEnabled && effective.pattern != LED_PATTERN_SOLID) {
+            applyPatternPixel(effective.pattern, i, baseColor, (usesLed1Color ? led2Color : led1Color), patternNowMs, 0, brightness,
+                              &color, &finalBrightness);
+        }
+        setPixel(i, color, finalBrightness);
     }
     showStrips();
 }
@@ -332,6 +359,11 @@ bool HeartbeatPixelThread::enqueueCommandStatusPattern(bool accepted)
     return enqueuePattern(originalStartupConfig, accepted ? 0x00FF00 : 0xFF0000, (uint32_t)(60000.0f / kStartupBpm));
 }
 
+bool HeartbeatPixelThread::enqueueGiftPattern(uint8_t patternType, uint32_t color1, uint32_t color2)
+{
+    return enqueuePattern(originalStartupConfig, color1, kGiftDurationMs, patternType, color2);
+}
+
 bool HeartbeatPixelThread::enqueueNotification(const LocalLedEffectiveConfig &effective, uint8_t pulseCount)
 {
     if (!effective.configured) {
@@ -356,7 +388,8 @@ bool HeartbeatPixelThread::enqueueNotification(const LocalLedEffectiveConfig &ef
     return true;
 }
 
-bool HeartbeatPixelThread::enqueuePattern(const LedPulseConfig *config, uint32_t color, uint32_t durationMs)
+bool HeartbeatPixelThread::enqueuePattern(const LedPulseConfig *config, uint32_t color, uint32_t durationMs, uint8_t patternType,
+                                          uint32_t color2)
 {
     if (!config || durationMs == 0) {
         return false;
@@ -371,6 +404,8 @@ bool HeartbeatPixelThread::enqueuePattern(const LedPulseConfig *config, uint32_t
     patternQueue[insertIndex].active = true;
     patternQueue[insertIndex].config = config;
     patternQueue[insertIndex].color = colorFromHex(color);
+    patternQueue[insertIndex].color2 = colorFromHex(color2);
+    patternQueue[insertIndex].patternType = patternType;
     patternQueue[insertIndex].durationMs = durationMs;
     patternQueue[insertIndex].startMs = 0;
     patternQueueCount++;
@@ -653,6 +688,88 @@ void HeartbeatPixelThread::syncBpm(uint32_t nowMs)
 HeartbeatPixelThread::RgbColor HeartbeatPixelThread::colorFromHex(uint32_t color)
 {
     return RgbColor{(uint8_t)((color >> 16) & 0xFF), (uint8_t)((color >> 8) & 0xFF), (uint8_t)(color & 0xFF)};
+}
+
+HeartbeatPixelThread::RgbColor HeartbeatPixelThread::hsvToRgb(float hue, float saturation, float value)
+{
+    const float h6 = (hue - floorf(hue)) * 6.0f;
+    const int sector = (int)h6;
+    const float f = h6 - (float)sector;
+    const float p = value * (1.0f - saturation);
+    const float q = value * (1.0f - saturation * f);
+    const float t = value * (1.0f - saturation * (1.0f - f));
+    float r = value, g = t, b = p;
+    switch (sector) {
+    case 1:
+        r = q; g = value; b = p;
+        break;
+    case 2:
+        r = p; g = value; b = t;
+        break;
+    case 3:
+        r = p; g = q; b = value;
+        break;
+    case 4:
+        r = t; g = p; b = value;
+        break;
+    case 5:
+        r = value; g = p; b = q;
+        break;
+    default:
+        break;
+    }
+    return RgbColor{(uint8_t)roundf(r * 255.0f), (uint8_t)roundf(g * 255.0f), (uint8_t)roundf(b * 255.0f)};
+}
+
+// Shared color/brightness math for both the one-shot "gift" overlay (renderPatternFrame) and the
+// persistent per-node ambient pattern (applyFrame). SOLID leaves brightness driven by the caller's
+// heartbeat envelope; the others compute their own timing so they read clearly regardless of BPM.
+void HeartbeatPixelThread::applyPatternPixel(uint8_t patternType, uint8_t ledIndex, const RgbColor &baseColor, const RgbColor &altColor,
+                                             uint32_t nowMs, uint32_t patternStartMs, float envelopeBrightness, RgbColor *colorOut,
+                                             float *brightnessOut) const
+{
+    const uint32_t elapsedMs = nowMs - patternStartMs;
+    switch (patternType) {
+    case LED_PATTERN_RAINBOW: {
+        const float hue = fmodf((float)elapsedMs / 3000.0f, 1.0f);
+        *colorOut = hsvToRgb(hue, 1.0f, 1.0f);
+        *brightnessOut = envelopeBrightness;
+        break;
+    }
+    case LED_PATTERN_SPARKLE: {
+        // Deterministic per-pixel flicker: a cheap integer hash of (time bucket, LED index) rather
+        // than random(), so this stays reentrant and doesn't disturb any other RNG consumer.
+        const uint32_t bucket = (elapsedMs / 60) + (uint32_t)ledIndex * 97u;
+        const uint32_t hash = bucket * 2654435761u;
+        const bool sparkling = (hash >> 24) % 100 < 6;
+        *colorOut = sparkling ? altColor : baseColor;
+        *brightnessOut = sparkling ? 1.0f : (envelopeBrightness * 0.5f);
+        break;
+    }
+    case LED_PATTERN_STROBE: {
+        *colorOut = baseColor;
+        *brightnessOut = ((elapsedMs / 120) % 2 == 0) ? 1.0f : 0.0f;
+        break;
+    }
+    case LED_PATTERN_CHASE: {
+        *colorOut = baseColor;
+        const uint8_t position = (uint8_t)((elapsedMs / 90) % kLedCount);
+        const uint8_t forwardDistance = (uint8_t)((ledIndex + kLedCount - position) % kLedCount);
+        if (forwardDistance == 0) {
+            *brightnessOut = 1.0f;
+        } else if (forwardDistance == 1) {
+            *brightnessOut = 0.35f;
+        } else {
+            *brightnessOut = 0.0f;
+        }
+        break;
+    }
+    case LED_PATTERN_SOLID:
+    default:
+        *colorOut = baseColor;
+        *brightnessOut = envelopeBrightness;
+        break;
+    }
 }
 
 void HeartbeatPixelThread::setPixel(uint8_t index, const RgbColor &color, float brightness)

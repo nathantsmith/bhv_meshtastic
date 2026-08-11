@@ -27,6 +27,7 @@ class HeartbeatPixelThread : private concurrency::OSThread
     bool enqueueChannelSendNotification(uint8_t channel);
     bool enqueueDirectMessageSendNotification(uint32_t nodeNum);
     bool enqueueCommandStatusPattern(bool accepted);
+    bool enqueueGiftPattern(uint8_t patternType, uint32_t color1, uint32_t color2);
 
   protected:
     int32_t runOnce() override;
@@ -80,6 +81,8 @@ class HeartbeatPixelThread : private concurrency::OSThread
         bool active = false;
         const LedPulseConfig *config = nullptr;
         RgbColor color = {};
+        RgbColor color2 = {};
+        uint8_t patternType = LED_PATTERN_SOLID;
         uint32_t startMs = 0;
         uint32_t durationMs = 0;
     };
@@ -92,6 +95,7 @@ class HeartbeatPixelThread : private concurrency::OSThread
     static constexpr uint32_t kStartupDurationMs = 1100;
     static constexpr uint8_t kNotificationQueueSize = 8;
     static constexpr uint8_t kPatternQueueSize = 4;
+    static constexpr uint32_t kGiftDurationMs = 3000;
     static constexpr uint8_t kLed1SequenceLength = 7;
     static constexpr uint8_t kLed2SequenceLength = 7;
     static constexpr uint8_t kBytesPerLed = 3;
@@ -151,7 +155,8 @@ class HeartbeatPixelThread : private concurrency::OSThread
     bool notificationChannelIsPendingLocked(uint8_t channel) const;
     bool notificationStateNeedsRender() const;
     bool enqueueNotification(const LocalLedEffectiveConfig &effective, uint8_t pulseCount);
-    bool enqueuePattern(const LedPulseConfig *config, uint32_t color, uint32_t durationMs);
+    bool enqueuePattern(const LedPulseConfig *config, uint32_t color, uint32_t durationMs, uint8_t patternType = LED_PATTERN_SOLID,
+                        uint32_t color2 = 0);
     PendingNotification *notificationQueueFrontLocked();
     void popNotificationQueueLocked();
     PatternEvent *patternQueueFrontLocked();
@@ -168,6 +173,10 @@ class HeartbeatPixelThread : private concurrency::OSThread
     void encodePixel(uint8_t index, uint8_t red, uint8_t green, uint8_t blue);
     static void encodeByteToRmt(uint8_t value, rmt_data_t *dest);
     static RgbColor colorFromHex(uint32_t color);
+    static RgbColor hsvToRgb(float hue, float saturation, float value);
+    void applyPatternPixel(uint8_t patternType, uint8_t ledIndex, const RgbColor &baseColor, const RgbColor &altColor,
+                           uint32_t nowMs, uint32_t patternStartMs, float envelopeBrightness, RgbColor *colorOut,
+                           float *brightnessOut) const;
     void showStrips();
     void clearStrips();
     void powerStrips(bool on);

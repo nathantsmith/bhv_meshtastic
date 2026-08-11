@@ -24,12 +24,23 @@ static const NamedColor kNamedColors[] = {
     {"amber", 0xFFBF00},     {"gold", 0xFFD700},   {"off", 0x000000},
 };
 
+struct NamedPattern {
+    const char *name;
+    uint8_t value;
+};
+
+static const NamedPattern kNamedPatterns[] = {
+    {"solid", LED_PATTERN_SOLID}, {"rainbow", LED_PATTERN_RAINBOW}, {"sparkle", LED_PATTERN_SPARKLE},
+    {"strobe", LED_PATTERN_STROBE}, {"chase", LED_PATTERN_CHASE},
+};
+
 static const char *kHelpText =
-    "help: #! get default|ch|dm|hr [field]; #! set default|ch|dm|hr <field> <value>; #! clear ch|dm <field>. Try: #! help dm, "
-    "#! help colors";
+    "help: #! get default|ch|dm|hr [field]; #! set default|ch|dm|hr <field> <value>; #! clear ch|dm <field>; #! gift "
+    "<pattern> [c1] [c2]; #! animate rainbow|blink (in a DM). Try: #! help dm, #! help colors, #! help patterns, #! help gift, "
+    "#! help animate";
 static const char *kNodeHelpText =
-    "default: get [color|idle_bpm|idle_delay|notify_pulses|send_pulses]; set color <c1> [c2]; set idle_bpm <1-600>; "
-    "set idle_delay <0-600000>; set notify_pulses <1-20>; set send_pulses <1-20>";
+    "default: get [color|idle_bpm|idle_delay|notify_pulses|send_pulses|pattern]; set color <c1> [c2]; set idle_bpm <1-600>; "
+    "set idle_delay <0-600000>; set notify_pulses <1-20>; set send_pulses <1-20>; set pattern <solid|rainbow|sparkle|strobe|chase>";
 static const char *kChannelHelpText =
     "ch: get [n] [color|notify_pulses|send_pulses]; set [n] color <c1> [c2]; set [n] notify_pulses|send_pulses "
     "<0-20>; clear [n] color|notify_pulses|send_pulses";
@@ -39,10 +50,10 @@ static const char *kDirectMessageHelpText =
 static const char *kHeartRateHelpText =
     "hr: get sensitivity; set sensitivity low|medium|high|default|<1-79>. Higher values increase MAX3010x LED drive";
 static const char *kGetHelpText =
-    "get: #! get default [color|idle_bpm|idle_delay|notify_pulses|send_pulses]; #! get ch [n] "
+    "get: #! get default [color|idle_bpm|idle_delay|notify_pulses|send_pulses|pattern]; #! get ch [n] "
     "[color|notify_pulses|send_pulses]; #! get dm [color|notify_pulses|send_pulses]; #! get hr sensitivity";
 static const char *kSetHelpText =
-    "set: default color|idle_bpm|idle_delay|notify_pulses|send_pulses; ch [n] color|notify_pulses|send_pulses; dm "
+    "set: default color|idle_bpm|idle_delay|notify_pulses|send_pulses|pattern; ch [n] color|notify_pulses|send_pulses; dm "
     "color|notify_pulses|send_pulses; hr sensitivity";
 static const char *kClearHelpText =
     "clear: #! clear ch [n] color|notify_pulses|send_pulses; #! clear dm color|notify_pulses|send_pulses|all|<slot>";
@@ -55,6 +66,16 @@ static const char *kSendPulsesHelpText =
 static const char *kColorsText =
     "colors: red orange yellow green blue indigo violet purple pink white warmwhite cyan magenta teal lime amber gold off or "
     "#RRGGBB";
+static const char *kPatternsText = "patterns: solid rainbow sparkle strobe chase";
+static const char *kPatternHelpText = "pattern: #! set default pattern <solid|rainbow|sparkle|strobe|chase>; #! get default pattern";
+static const char *kGiftHelpText =
+    "gift: #! gift <solid|rainbow|sparkle|strobe|chase> [c1] [c2] - plays a one-time LED burst on the receiving badge only; "
+    "does not change their saved settings. Colors default to the receiver's own colors if omitted";
+static const char *kAnimateHelpText =
+    "animate: #! animate rainbow | #! animate blink [color] - sent inside a direct message, targets that peer only. Add "
+    "\"ch [n]\" to instead broadcast to a whole channel (n defaults to the current/resolved channel), affecting every "
+    "listening badge - opt-in only, never implied. Works even on unmodified firmware via ordinary set-color commands. "
+    "Permanently changes default color (ends on the standard blue/red default) - there is no way to restore prior colors";
 
 size_t commandPrefixLength(const char *text)
 {
@@ -164,6 +185,18 @@ bool setHelpForTopic(const char *topic, LocalLedCommandResult *result)
     }
     if (strcasecmp(topic, "colors") == 0 || strcasecmp(topic, "color") == 0) {
         setResponse(result, false, "%s", kColorsText);
+        return true;
+    }
+    if (strcasecmp(topic, "patterns") == 0 || strcasecmp(topic, "pattern") == 0) {
+        setResponse(result, false, "%s", kPatternsText);
+        return true;
+    }
+    if (strcasecmp(topic, "gift") == 0) {
+        setResponse(result, false, "%s", kGiftHelpText);
+        return true;
+    }
+    if (strcasecmp(topic, "animate") == 0) {
+        setResponse(result, false, "%s", kAnimateHelpText);
         return true;
     }
     if (strcasecmp(topic, "color") == 0 || strcasecmp(topic, "led") == 0) {
@@ -289,6 +322,30 @@ bool parseNamedColor(const char *text, uint32_t *color)
 bool parseColor(const char *text, uint32_t *color)
 {
     return parseHexColor(text, color) || parseNamedColor(text, color);
+}
+
+bool parsePattern(const char *text, uint8_t *pattern)
+{
+    if (!text) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(kNamedPatterns) / sizeof(kNamedPatterns[0]); ++i) {
+        if (strcasecmp(text, kNamedPatterns[i].name) == 0) {
+            *pattern = kNamedPatterns[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *patternName(uint8_t pattern)
+{
+    for (size_t i = 0; i < sizeof(kNamedPatterns) / sizeof(kNamedPatterns[0]); ++i) {
+        if (kNamedPatterns[i].value == pattern) {
+            return kNamedPatterns[i].name;
+        }
+    }
+    return "solid";
 }
 
 uint8_t tokenize(char *text, char *tokens[], uint8_t maxTokens)
@@ -432,8 +489,10 @@ void handleNodeGet(const CustomLedConfig &config, uint8_t argc, char *argv[], Lo
     formatColor(led2, sizeof(led2), config.node_led2_color);
 
     if (argc == 0) {
-        setResponse(result, false, "default color color1=%s color2=%s idle_bpm=%u idle_delay=%lu notify_pulses=%u send_pulses=%u",
-                    led1, led2, config.idle_bpm, (unsigned long)config.idle_delay_ms, config.notification_pulses, config.send_pulses);
+        setResponse(result, false,
+                    "default color color1=%s color2=%s idle_bpm=%u idle_delay=%lu notify_pulses=%u send_pulses=%u pattern=%s", led1,
+                    led2, config.idle_bpm, (unsigned long)config.idle_delay_ms, config.notification_pulses, config.send_pulses,
+                    patternName(config.node_pattern));
         return;
     }
     if (argc != 1) {
@@ -442,6 +501,10 @@ void handleNodeGet(const CustomLedConfig &config, uint8_t argc, char *argv[], Lo
     }
     if (isColorField(argv[0])) {
         setResponse(result, false, "default color color1=%s color2=%s", led1, led2);
+        return;
+    }
+    if (strcasecmp(argv[0], "pattern") == 0) {
+        setResponse(result, false, "default pattern=%s", patternName(config.node_pattern));
         return;
     }
     if (strcasecmp(argv[0], "idle_bpm") == 0) {
@@ -501,6 +564,25 @@ void handleNodeSet(CustomLedConfig &config, uint8_t argc, char *argv[], LocalLed
         formatColor(led1, sizeof(led1), config.node_led1_color);
         formatColor(led2, sizeof(led2), config.node_led2_color);
         setResponse(result, true, "OK default color color1=%s color2=%s", led1, led2);
+        return;
+    }
+
+    if (strcasecmp(argv[0], "pattern") == 0) {
+        if (argc == 2 && isHelpToken(argv[1])) {
+            setResponse(result, false, "%s", kPatternHelpText);
+            return;
+        }
+        if (argc == 1) {
+            setResponse(result, false, "ERR missing value");
+            return;
+        }
+        uint8_t pattern = 0;
+        if (argc != 2 || !parsePattern(argv[1], &pattern)) {
+            setResponse(result, false, "ERR invalid pattern");
+            return;
+        }
+        config.node_pattern = pattern;
+        setResponse(result, true, "OK default pattern=%s", patternName(pattern));
         return;
     }
 
@@ -1272,6 +1354,116 @@ bool handleLocalLedCommand(CustomLedConfig &config, const LocalLedCommandContext
         } else if (tokenCount != 2 || !setHelpForTopic(tokens[1], result)) {
             setUnknown(result);
         }
+        return true;
+    }
+
+    if (strcasecmp(tokens[0], "gift") == 0) {
+        if (tokenCount < 2 || isHelpToken(tokens[1])) {
+            setResponse(result, false, "%s", kGiftHelpText);
+            return true;
+        }
+        uint8_t pattern = 0;
+        if (!parsePattern(tokens[1], &pattern)) {
+            setResponse(result, false, "ERR invalid pattern");
+            return true;
+        }
+        if (tokenCount > 4) {
+            setResponse(result, false, "ERR too many colors");
+            return true;
+        }
+        uint32_t color1 = config.node_led1_color;
+        uint32_t color2 = config.node_led2_color;
+        if (tokenCount >= 3) {
+            if (!parseColor(tokens[2], &color1)) {
+                setResponse(result, false, "ERR invalid color");
+                return true;
+            }
+            color2 = color1;
+        }
+        if (tokenCount >= 4) {
+            if (!parseColor(tokens[3], &color2)) {
+                setResponse(result, false, "ERR invalid color");
+                return true;
+            }
+        }
+        result->handled = true;
+        result->consume_packet = true;
+        result->persist = false;
+        result->trigger_gift = true;
+        result->gift_pattern = pattern;
+        result->gift_color1 = color1;
+        result->gift_color2 = color2;
+        snprintf(result->response, sizeof(result->response), "OK gift %s color1=#%06X color2=#%06X", patternName(pattern),
+                 (unsigned int)(color1 & 0xFFFFFF), (unsigned int)(color2 & 0xFFFFFF));
+        return true;
+    }
+
+    if (strcasecmp(tokens[0], "animate") == 0) {
+        if (tokenCount < 2 || isHelpToken(tokens[1])) {
+            setResponse(result, false, "%s", kAnimateHelpText);
+            return true;
+        }
+        const bool isBlink = strcasecmp(tokens[1], "blink") == 0;
+        if (!isBlink && strcasecmp(tokens[1], "rainbow") != 0) {
+            setResponse(result, false, "ERR unknown animate pattern; try rainbow or blink");
+            return true;
+        }
+
+        // Optional "ch [n]" opt-in switches the target from the current DM peer to a broadcast on
+        // channel n (or the resolved/current channel if n is omitted). Never implied - a bare
+        // "#! animate rainbow" always stays scoped to a single DM peer.
+        uint8_t argIndex = 2;
+        bool broadcast = false;
+        bool hasExplicitChannel = false;
+        uint8_t explicitChannel = 0;
+        if (tokenCount > argIndex && strcasecmp(tokens[argIndex], "ch") == 0) {
+            broadcast = true;
+            argIndex++;
+            if (tokenCount > argIndex && parseChannelToken(tokens[argIndex], &explicitChannel)) {
+                hasExplicitChannel = true;
+                argIndex++;
+            }
+        }
+
+        uint32_t color = 0xFFFFFF;
+        if (isBlink && tokenCount > argIndex) {
+            if (!parseColor(tokens[argIndex], &color)) {
+                setResponse(result, false, "ERR invalid color");
+                return true;
+            }
+            argIndex++;
+        }
+        if (tokenCount > argIndex) {
+            setResponse(result, false, isBlink ? "ERR too many colors" : "ERR too many arguments");
+            return true;
+        }
+
+        uint32_t targetNode = 0;
+        uint8_t targetChannel = 0;
+        if (broadcast) {
+            if (!resolveChannel(context, hasExplicitChannel, explicitChannel, &targetChannel, result)) {
+                return true;
+            }
+        } else {
+            if (!context.has_direct_message_peer) {
+                setResponse(result, false, "ERR animate requires an active direct message; add \"ch [n]\" to broadcast instead");
+                return true;
+            }
+            targetNode = context.direct_message_peer;
+            targetChannel = context.reply_channel;
+        }
+
+        result->handled = true;
+        result->consume_packet = true;
+        result->persist = false;
+        result->trigger_remote_animation = true;
+        result->remote_animation_kind = isBlink ? REMOTE_ANIM_BLINK : REMOTE_ANIM_RAINBOW;
+        result->remote_animation_target = targetNode;
+        result->remote_animation_broadcast = broadcast;
+        result->remote_animation_channel = targetChannel;
+        result->remote_animation_color = color;
+        snprintf(result->response, sizeof(result->response), "OK animate %s -> %s over ~%d min", tokens[1],
+                 broadcast ? "broadcasting to channel" : "sending to peer", isBlink ? 1 : 2);
         return true;
     }
 
