@@ -206,6 +206,16 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
                 sendToPhone(replyPacket);
             }
         }
+#if defined(USERPREFS_BHV_INJECTOR) && USERPREFS_BHV_INJECTOR
+        // Opt-in "injector" mode (default off): the command was already applied and
+        // acked locally above; also broadcast a copy over the mesh so other badges
+        // that have opted in to accepting over-air LED commands apply it too. Used for
+        // consensual, coordinated light shows. Default builds are unchanged.
+        meshtastic_MeshPacket *injected = packetPool.allocCopy(p);
+        if (injected) {
+            sendToMesh(injected, RX_SRC_USER);
+        }
+#endif
         return;
     }
 
