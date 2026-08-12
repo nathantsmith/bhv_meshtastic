@@ -15,8 +15,13 @@ on:
       - "**.md"
       - version.properties
 
-  # Note: This is different from "pull_request". Need to specify ref when doing checkouts.
-  pull_request_target:
+  # Build PRs (including from forks) with the standard, safe `pull_request` trigger.
+  # `pull_request_target` runs in the base-repo (privileged) context, and since
+  # actions/checkout@v6 defaults to `allow-unsafe-pr-checkout: false` it refuses to
+  # check out a fork PR's code there — so every fork PR failed at checkout before it
+  # could build. Building a PR needs no repo secrets, so `pull_request` is both safer
+  # (read-only token, no secret exposure to fork code) and actually works for forks.
+  pull_request:
     branches:
       - master
       - develop
