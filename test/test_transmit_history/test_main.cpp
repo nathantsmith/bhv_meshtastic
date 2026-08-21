@@ -22,14 +22,31 @@ void tearDown(void) {}
 
 static void test_setLastSentToMesh_stores_millis()
 {
+    // Bracket the call rather than allowing a wall-clock tolerance afterwards.
+    //
+    // This previously stored the value, then asserted millis() - result <= 100. That is a real-time
+    // budget on a process the OS is free to deschedule, so it failed intermittently whenever the machine
+    // was loaded - visible only in full-suite runs, never when this test ran alone, which is the classic
+    // signature of a timing flake rather than a logic error.
+    //
+    // Bracketing is both immune to scheduling and a STRONGER assertion: the timestamp must have been
+    // taken during the call, not merely near it.
+    //
+    // The wait handles a second, opposite race: millis() starts at 0 on portduino, so if this test
+    // reaches the store within the first millisecond the stored value IS 0 - and zero is exactly what
+    // this map uses to mean "never sent". The two flakes fire under opposite conditions, which is why
+    // this test failed intermittently in both directions.
+    while (millis() == 0) {
+        testDelay(1);
+    }
+    const uint32_t before = millis();
     transmitHistory->setLastSentToMesh(meshtastic_PortNum_NODEINFO_APP);
+    const uint32_t after = millis();
 
     uint32_t result = transmitHistory->getLastSentToMeshMillis(meshtastic_PortNum_NODEINFO_APP);
     TEST_ASSERT_NOT_EQUAL(0, result);
-
-    // The stored millis value should be very close to current millis()
-    uint32_t diff = millis() - result;
-    TEST_ASSERT_LESS_OR_EQUAL(100, diff); // Within 100ms
+    TEST_ASSERT_TRUE_MESSAGE(result >= before && result <= after,
+                             "stored millis must fall within the interval spanning the call");
 }
 
 static void test_set_overwrites_previous_value()
