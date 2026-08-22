@@ -2642,10 +2642,10 @@ void menuHandler::frameTogglesMenu()
             screen->runNow();
         } else if (selected == show_health_telemetry) {
             moduleConfig.telemetry.health_screen_enabled = !moduleConfig.telemetry.health_screen_enabled;
-            // Health frame is useful only when the module is actively measuring.
-            if (moduleConfig.telemetry.health_screen_enabled) {
-                moduleConfig.telemetry.health_measurement_enabled = true;
-            }
+            // Deliberately does NOT touch health_measurement_enabled. That flag gates transmission of the
+            // wearer's biometrics to the mesh and MQTT, so silently enabling it from a menu item labelled
+            // "show health telemetry" published identified vitals as a side effect of turning on a local
+            // display. The screen reads the sensor cache directly and works with broadcasting disabled.
             menuHandler::menuQueue = menuHandler::FrameToggles;
             screen->runNow();
         }

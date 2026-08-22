@@ -135,7 +135,17 @@ int32_t HealthTelemetryModule::runOnce()
         Default::getConfiguredOrDefaultMsScaled(moduleConfig.telemetry.health_update_interval,
                                                 default_telemetry_broadcast_interval_secs, numOnlineNodes);
     uint32_t result = min(sendToPhoneIntervalMs, meshSendIntervalMs);
-    if (measurementEnabled || pollForScreen) {
+    // Must match the condition guarding serviceSensor() below. Servicing the sensor at only
+    // healthPollIntervalMs (1000 ms) starves the presence state machine: the scan wake window is
+    // MAX30102_PRESENCE_SCAN_WAKE_WINDOW_MS (700 ms) and activation needs
+    // MAX3010X_PRESENCE_CONSECUTIVE_REQUIRED (2) consecutive detections, so at one evaluation per second
+    // exactly one lands inside each wake window, the consecutive counter reaches 1, and sleep() then
+    // resets it to 0. Presence can never fire, no matter how good the signal is.
+    //
+    // Measured: a firm fingertip passed both the DC and peak gates on 19 of 19 presence evaluations and
+    // still produced zero activations, because this branch had dropped to the 1000 ms cadence once
+    // broadcasting became opt-in and the display timed out.
+    if (measurementEnabled || healthScreenEnabled) {
         result = min(result, sensorServiceIntervalMs);
     } else {
         result = min(result, healthPollIntervalMs);
@@ -157,9 +167,28 @@ int32_t HealthTelemetryModule::runOnce()
 
     // Keep-awake is disabled so MAX3010x always uses sleep/presence-scan behavior when possible.
     if (max30102Sensor.hasSensor()) {
+#ifdef BHV_PPG_DIAG
+        // Diagnostic builds hold the sensor in ACTIVE mode so register-level experiments run without a
+        // finger present. Costs battery; never enabled in a normal build.
+        const bool keepPulseOxAwake = true;
+#else
         const bool keepPulseOxAwake = false;
+#endif
         max30102Sensor.setStayAwake(keepPulseOxAwake);
-        if (measurementEnabled || pollForScreen || max30102Sensor.isActive()) {
+        // Service the sensor whenever the health feature is enabled AT ALL - not only while the screen
+        // happens to be awake.
+        //
+        // This used to test pollForScreen, which additionally requires screen->isScreenOn(). That was
+        // harmless while health_measurement_enabled defaulted to true, because the first term kept the
+        // sensor running regardless. Once broadcasting became opt-in, it became a trap: with the screen
+        // timed out, nothing serviced the sensor, so presence scanning stopped, so a finger could never
+        // be detected, so the screen could never auto-wake for it. The badge's headline interaction died
+        // silently the first time the display slept.
+        //
+        // Transmission remains gated on measurementEnabled further down, so biometrics still do not leave
+        // the device unless the user opts in. This only keeps the low-power presence scan alive, which is
+        // exactly what it exists for.
+        if (measurementEnabled || healthScreenEnabled || max30102Sensor.isActive()) {
             max30102Sensor.serviceSensor();
         }
     }
@@ -312,7 +341,6 @@ void HealthTelemetryModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *
 
     char hrStr[8] = "--";
     char spo2Str[8] = "--";
-    char tempStr[16] = "--";
 
     if (lastMeasurement.variant.health_metrics.has_heart_bpm) {
         snprintf(hrStr, sizeof(hrStr), "%u", lastMeasurement.variant.health_metrics.heart_bpm);
@@ -320,17 +348,24 @@ void HealthTelemetryModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *
     if (lastMeasurement.variant.health_metrics.has_spO2) {
         snprintf(spo2Str, sizeof(spo2Str), "%u", lastMeasurement.variant.health_metrics.spO2);
     }
-    if (lastMeasurement.variant.health_metrics.has_temperature) {
+    // Die temperature is shown EXPLICITLY LABELLED and read from a dedicated accessor, never from the
+    // health-metrics temperature field. The MAX3010x can only measure its own package temperature, which
+    // is not a body temperature; the previous "T:33C" rendering read as hypothermia (see the badge's own
+    // promotional artwork). It stays visible because it is a genuinely useful diagnostic - it is the only
+    // in-situ measure of the thermal state that shifts the red LED's wavelength - but it may not
+    // masquerade as a vital sign.
+    char dieTempStr[16] = "";
+    float dieTempC = 0.0f;
+    if (max30102Sensor.getDieTemperatureC(&dieTempC)) {
         if (moduleConfig.telemetry.environment_display_fahrenheit) {
-            snprintf(tempStr, sizeof(tempStr), "%.0fF",
-                     UnitConversions::CelsiusToFahrenheit(lastMeasurement.variant.health_metrics.temperature));
+            snprintf(dieTempStr, sizeof(dieTempStr), " die:%.0fF", UnitConversions::CelsiusToFahrenheit(dieTempC));
         } else {
-            snprintf(tempStr, sizeof(tempStr), "%.0fC", lastMeasurement.variant.health_metrics.temperature);
+            snprintf(dieTempStr, sizeof(dieTempStr), " die:%.0fC", dieTempC);
         }
     }
 
-    char metricLine[40];
-    snprintf(metricLine, sizeof(metricLine), "HR:%s O2:%s T:%s", hrStr, spo2Str, tempStr);
+    char metricLine[48];
+    snprintf(metricLine, sizeof(metricLine), "HR:%s O2:%s%s", hrStr, spo2Str, dieTempStr);
     display->drawString(x, contentY, metricLine);
 
     uint32_t irWave[MAX30102_BUFFER_LEN];

@@ -50,7 +50,7 @@ Every page includes a shutdown option:
 The badge combines three experiences:
 
 - **A Meshtastic radio.** Messages travel from badge to badge over LoRa. Nearby badges can relay packets, extending the event mesh without relying on internet or cellular infrastructure.
-- **A pulse-sensing heart.** A MAX3010x optical sensor measures heart rate and blood-oxygen data when a finger is present. While a reading is active, the 14 heartbeat LEDs follow the measured pulse; otherwise they animate at the configured idle rate.
+- **A pulse-sensing heart.** A MAX3010x optical sensor estimates heart rate when a finger is present, and produces an *experimental, uncalibrated* blood-oxygen estimate. While a reading is active, the 14 heartbeat LEDs follow the measured pulse; otherwise they animate at the configured idle rate. **Not a medical device — see [Measurement accuracy](#measurement-accuracy).**
 - **A social light layer.** Sending or receiving channel messages and direct messages creates colored pulses. Colors and pulse counts can be customized globally, for a channel, or for an individual direct-message conversation.
 
 The badge ships with two event channels:
@@ -82,9 +82,48 @@ Send that command inside the direct-message conversation to personalize that pee
 
 Place a finger steadily over the optical sensor. Once the badge has a usable signal, its LEDs follow the live heart-rate reading and the badge can report heart-rate and SpO2 telemetry through Meshtastic. Remove your finger and the badge returns to its idle heartbeat.
 
+The badge deliberately shows nothing rather than a number it cannot stand behind, so `--` while acquiring — or instead of an SpO2 reading — is normal and expected. See [Measurement accuracy](#measurement-accuracy).
+
+Broadcasting your heart rate and SpO2 to the mesh is **off by default**. Turning on the health screen shows readings locally only; enable `health_measurement_enabled` explicitly if you want the badge to transmit them.
+
 ### Follow Village announcements
 
 BHV staff post a schedule change to `BHV Info`. Attendee badges receive and relay the announcement and show the configured notification pulse, while the read-only policy prevents ordinary attendee posts from flooding the announcements channel.
+
+## Measurement accuracy
+
+**This badge is not a medical device. Do not use it for anything that matters.**
+
+It is a fun, open pulse-sensing wearable. Being honest about what its numbers mean is part of the fun,
+so here is where they actually stand.
+
+**Heart rate — reasonable for a stationary spot check.** Hold still with a finger resting steadily on the
+sensor and the reading is usually sensible. It is derived from the IR channel, which is the more robust of
+the two, and it is gated on the signal actually being periodic rather than merely present. Move, press
+lightly, or press too hard and the badge will show `--` rather than guess.
+
+**SpO2 — experimental and uncalibrated. Treat it as a curiosity, not a measurement.** Two independent
+reasons:
+
+1. **No final-system calibration.** Converting the red/IR ratio into a saturation percentage requires
+   coefficients fitted to *this* badge's specific optical path — the sensor module, the board cutout it
+   looks through, the enclosure, and how a finger sits on it. Those coefficients do not exist. The firmware
+   uses a generic vendor lookup table, which cannot establish accuracy for this hardware.
+2. **The vendor curve has no resolution where healthy people live.** Its calibration parabola peaks around
+   a ratio of 0.34, and measurements from real badges land near 0.41 — inside a band where the table
+   returns 100% for a wide range of inputs. So a healthy reading tends to rail at 100% regardless of the
+   true value. That is an artefact of the curve, not a property of your blood.
+
+Because of this the firmware withholds SpO2 far more often than it withholds heart rate, and requires the
+red channel to demonstrably carry a pulse of its own before accepting a value at all — a failed red channel
+otherwise produces a *reassuring* number rather than an obviously broken one.
+
+**What would change this.** Honest SpO2 needs a calibration study against a reference instrument across a
+range of real saturations, on frozen optics. That is a serious undertaking and has not been done. Until it
+is, the number on the screen is a demonstration of the sensing chain, not a claim about your oxygen
+saturation.
+
+If a reading ever concerns you, use a real pulse oximeter.
 
 ## Make the badge yours
 
@@ -261,7 +300,7 @@ For implementation details, see [the local LED command protocol](README-local-le
 
 ## What this fork adds
 
-- MAX3010x heart-rate and SpO2 sensing with low-power finger detection
+- MAX3010x heart-rate sensing with low-power finger detection, plus an experimental (uncalibrated) SpO2 estimate
 - A 14-pixel animated heartbeat synchronized to live heart-rate telemetry
 - Custom colors and send/receive pulse patterns for channels and direct messages
 - Per-person direct-message lighting profiles

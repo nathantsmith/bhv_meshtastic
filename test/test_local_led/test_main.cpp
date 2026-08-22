@@ -77,9 +77,11 @@ static void test_command_prefix_aliases()
     CustomLedConfig config = {};
     LocalLedConfigStore::applyDefaults(&config);
     LocalLedCommandResult result = {};
-    static const char anatomicalHeartPrefix[] = "\xF0\x9F\xAB\x80";
-
-    TEST_ASSERT_TRUE(handleLocalLedCommand(config, makeContext(), anatomicalHeartPrefix " set default led green", &result));
+    // U+1FAC0 ANATOMICAL HEART, spelled out so the source stays ASCII. Must be a single literal:
+    // string-literal concatenation only works between literals, so `prefix " ..."` with prefix a
+    // variable is a syntax error rather than a concatenation.
+    TEST_ASSERT_TRUE(
+        handleLocalLedCommand(config, makeContext(), "\xF0\x9F\xAB\x80" " set default led green", &result));
     TEST_ASSERT_TRUE(result.persist);
     TEST_ASSERT_EQUAL_STRING("OK default color color1=#00FF00 color2=#00FF00", result.response);
 
@@ -210,7 +212,10 @@ static void test_persistence_round_trip()
     config.channels[4].led2_color = 0x334455;
     config.channels[4].configured = true;
 
-    uint8_t buffer[128] = {};
+    // Must be at least LocalLedConfig.cpp's kSerializedSize (273 at format v8); serializeConfig
+    // refuses a smaller buffer. This was 128 - correct for the v7 format, silently stale after v8
+    // grew the record, and invisible because this file did not compile.
+    uint8_t buffer[320] = {};
     size_t used = 0;
     TEST_ASSERT_TRUE(LocalLedConfigStore::serializeConfig(config, buffer, sizeof(buffer), &used));
 
@@ -253,15 +258,23 @@ static void test_local_phone_command_helper_consumes_command()
     TEST_ASSERT_EQUAL_UINT16(24, testStore->getConfig().idle_bpm);
 }
 
-static void test_over_air_module_stops_processing_for_command()
+static void test_over_air_command_is_consumed_but_does_not_mutate()
 {
     TestableLocalLedCommandModule module;
     meshtastic_MeshPacket packet = makeTextPacket("#! set ch 6 led #FF0000 #00FFFF", 1);
 
+    // An over-air command is still consumed, so it is not surfaced as chat, but it must
+    // not mutate this node's LED config -- any node could otherwise repaint a stranger's
+    // badge. Mutation requires the operator to opt in at build time. See the
+    // local_client_origin gate in src/led/LocalLedConfig.cpp.
     TEST_ASSERT_EQUAL(ProcessMessage::STOP, module.handleReceived(packet));
+#if defined(USERPREFS_BHV_ACCEPT_OVER_AIR_LED) && USERPREFS_BHV_ACCEPT_OVER_AIR_LED
     TEST_ASSERT_TRUE(testStore->getConfig().channels[6].configured);
     TEST_ASSERT_EQUAL_HEX32(0xFF0000, testStore->getConfig().channels[6].led1_color);
     TEST_ASSERT_EQUAL_HEX32(0x00FFFF, testStore->getConfig().channels[6].led2_color);
+#else
+    TEST_ASSERT_FALSE(testStore->getConfig().channels[6].configured);
+#endif
 }
 
 void setup()
@@ -281,7 +294,7 @@ void setup()
     RUN_TEST(test_persistence_round_trip);
     RUN_TEST(test_store_effective_config_falls_back_and_overrides);
     RUN_TEST(test_local_phone_command_helper_consumes_command);
-    RUN_TEST(test_over_air_module_stops_processing_for_command);
+    RUN_TEST(test_over_air_command_is_consumed_but_does_not_mutate);
     exit(UNITY_END());
 }
 

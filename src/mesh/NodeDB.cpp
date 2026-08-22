@@ -927,9 +927,15 @@ void NodeDB::installDefaultModuleConfig()
     moduleConfig.telemetry.environment_screen_enabled = false;
 
 #if defined(HELTEC_V4) || defined(HELTEC_V4_TFT)
-    // Enable health telemetry by default for Heltec V4 builds so MAX30102
-    // readings are visible on-device after a fresh config install.
-    moduleConfig.telemetry.health_measurement_enabled = true;
+    // Show the health frame by default so MAX30102 readings are visible on-device after a fresh config
+    // install, but do NOT broadcast by default.
+    //
+    // health_measurement_enabled does not merely enable measuring: it gates transmission of the wearer's
+    // heart rate and SpO2 to the mesh and to MQTT, attributed to their node (see HealthTelemetryModule::
+    // sendTelemetry / allocReply). Defaulting that to true published identified biometrics from an
+    // out-of-the-box badge, which is a poor default for a device worn at a security conference. The local
+    // screen works without it, so presence of the frame no longer implies broadcasting.
+    moduleConfig.telemetry.health_measurement_enabled = false;
     moduleConfig.telemetry.health_screen_enabled = true;
 #endif
 }

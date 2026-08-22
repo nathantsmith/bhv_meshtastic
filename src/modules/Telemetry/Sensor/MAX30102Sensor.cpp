@@ -4,6 +4,7 @@
 
 #include "../mesh/generated/meshtastic/telemetry.pb.h"
 #include "MAX30102Sensor.h"
+#include "PpgSignalQuality.h"
 #include "TelemetrySensor.h"
 #include "concurrency/LockGuard.h"
 #include <math.h>
@@ -54,6 +55,20 @@ bool MAX30102Sensor::getRawWaveformSnapshot(uint32_t *irOut, uint32_t *redOut, u
     return true;
 }
 
+bool MAX30102Sensor::getDieTemperatureC(float *outC)
+{
+    if (!outC) {
+        return false;
+    }
+
+    concurrency::LockGuard g(&metricsLock);
+    if (!cachedHasDieTempC) {
+        return false;
+    }
+    *outC = cachedDieTempC;
+    return true;
+}
+
 void MAX30102Sensor::clearCachedMetrics()
 {
     concurrency::LockGuard g(&metricsLock);
@@ -62,15 +77,15 @@ void MAX30102Sensor::clearCachedMetrics()
     cachedHeartRate = 0;
     cachedHasSpO2 = false;
     cachedSpO2 = 0;
-    cachedHasTemperature = false;
-    cachedTemperatureC = 0.0f;
+    cachedHasDieTempC = false;
+    cachedDieTempC = 0.0f;
     cachedFingerPresent = false;
     latchedHasHeartRate = false;
     latchedHeartRate = 0;
     latchedHasSpO2 = false;
     latchedSpO2 = 0;
-    latchedHasTemperature = false;
-    latchedTemperatureC = 0.0f;
+    latchedHasDieTempC = false;
+    latchedDieTempC = 0.0f;
     lastStableHeartMs = 0;
     lastStableSpO2Ms = 0;
     lastStableTempMs = 0;
@@ -89,6 +104,10 @@ void MAX30102Sensor::resetSlidingState()
     slidingNewSamplesSinceEval = 0;
     lastEvalMs = 0;
     max30100RawSampleCount = 0;
+    activeEpochStartMeanIr = 0;
+    epochAnchorCount = 0;
+    noFingerEvalStreak = 0;
+    alcOverflowEvents = 0;
 }
 
 void MAX30102Sensor::resetStabilityState()
@@ -243,8 +262,16 @@ bool MAX30102Sensor::updateLowPowerPresenceCache()
     present = rawPresent && (max30102PresenceConsecutiveDetections >= MAX3010X_PRESENCE_CONSECUTIVE_REQUIRED);
 
     const uint32_t nowMs = millis();
-    if ((max30102PresenceStatsLastLogMs == 0) ||
-        ((uint32_t)(nowMs - max30102PresenceStatsLastLogMs) >= MAX30102_PRESENCE_STATS_LOG_INTERVAL_MS)) {
+    // Only log once the detection block above actually ran, otherwise every line reports hard-coded zeros.
+    // The scan cycle is WAKE_WINDOW (700 ms) + SCAN_INTERVAL (1000 ms) = 1700 ms while the rate limit is
+    // 1000 ms, and sleep() zeroes the timestamp - so exactly one tick per wake was admitted and it was
+    // always the first, taken right after resetSlidingState() when slidingSampleCount == 1. That is below
+    // MAX3010X_PRESENCE_MIN_SAMPLES, so meanIr/maxIr were never computed. Every presence line ever logged
+    // by this firmware (158/158 across a 5-minute capture) read "mean_ir=0 max_ir=0 n=1", which means the
+    // presence thresholds have never been observable, let alone validated, from these logs.
+    if ((recentCount >= MAX3010X_PRESENCE_MIN_SAMPLES) &&
+        ((max30102PresenceStatsLastLogMs == 0) ||
+         ((uint32_t)(nowMs - max30102PresenceStatsLastLogMs) >= MAX30102_PRESENCE_STATS_LOG_INTERVAL_MS))) {
         max30102PresenceStatsLastLogMs = nowMs;
         LOG_INFO("MAX30102 presence stats(low): present=%d raw=%d mean_ir=%u mean_red=%u max_ir=%u max_red=%u dc=%d peak=%d n=%u c=%u",
                  present, rawPresent, meanIr, meanRed, maxIr, maxRed, dcPresent, peakPresent, recentCount,
@@ -264,14 +291,14 @@ bool MAX30102Sensor::updateLowPowerPresenceCache()
     cachedHeartRate = 0;
     cachedHasSpO2 = false;
     cachedSpO2 = 0;
-    cachedHasTemperature = false;
-    cachedTemperatureC = 0.0f;
+    cachedHasDieTempC = false;
+    cachedDieTempC = 0.0f;
     latchedHasHeartRate = false;
     latchedHeartRate = 0;
     latchedHasSpO2 = false;
     latchedSpO2 = 0;
-    latchedHasTemperature = false;
-    latchedTemperatureC = 0.0f;
+    latchedHasDieTempC = false;
+    latchedDieTempC = 0.0f;
     hasHeartEma = false;
     heartEma = 0.0f;
     hasHeartOutputEma = false;
@@ -400,10 +427,85 @@ bool MAX30102Sensor::readMAX30100Temperature(TwoWire *bus, uint8_t address, floa
     return true;
 }
 
+void MAX30102Sensor::discardSampleWindow()
+{
+    // Deliberately narrower than resetSlidingState(): the accumulated PPG is unusable, but the active
+    // epoch's DC anchor and no-finger streak describe the CONTACT, which has not changed. Clearing those
+    // too would restart the epoch on every transient and churn the session.
+    memset(slidingIrWindow, 0, sizeof(slidingIrWindow));
+    memset(slidingRedWindow, 0, sizeof(slidingRedWindow));
+    slidingWriteIndex = 0;
+    slidingSampleCount = 0;
+    slidingNewSamplesSinceEval = 0;
+}
+
 uint16_t MAX30102Sensor::ingestMAX30102Fifo(TwoWire *bus, uint8_t address)
 {
     if (!bus || address == 0) {
         return 0;
+    }
+
+    // Sample-stream integrity, checked BEFORE draining.
+    //
+    // Everything downstream assumes samples are uniformly spaced at the effective 25 Hz: the vendor kernel
+    // hard-codes that rate, and the autocorrelation converts lag to BPM with it. If the part dropped
+    // samples, the time axis is wrong and every rate derived from the window is wrong with it - silently,
+    // and in a way that looks like a plausible heart rate rather than an error.
+    //
+    // OVF_COUNTER must be read first because the part clears it as soon as a complete sample is popped.
+    // It also disambiguates the pointer aliasing: a completely full FIFO has wr == rd, identical to empty,
+    // so `available` alone cannot tell "nothing new" from "you lost everything".
+    //
+    // Scoped to ACTIVE mode on purpose. Presence scanning runs at 100 sps with no averaging, giving only
+    // ~320 ms of FIFO, and it re-clears the buffer every wake anyway - so overflow there is expected,
+    // harmless, and invalidating on it would break presence detection entirely.
+    //
+    // MEASURED, AND THE REASON THIS ONLY OBSERVES: on real hardware OVF_COUNTER is non-zero on virtually
+    // every service call - 4.8 events/s against a 5/s service cadence, 5.3 lost samples per event, and
+    // 25.5 lost samples/s against a 25 Hz production rate. Discarding the accumulated window on that flag
+    // (which is what the design review recommended, unqualified) cleared the ring buffer every 200 ms so
+    // it never reached the 100 samples an evaluation needs: measurement stopped completely, hasWindow
+    // stayed 0, and the badge produced nothing at all.
+    //
+    // So the flag is real and continuous, not occasional. Until we understand WHY - whether the part is
+    // producing faster than the configured 25 Hz, whether the drain loop's
+    // available = (wr - rd) & 0x1F aliases a full FIFO to empty and stalls, or whether the counter simply
+    // is not cleared the way the datasheet describes - it cannot be used as an invalidation trigger.
+    // Counting it is genuinely new information; acting on it destroys the feature.
+    if (!max30102PresenceMode) {
+        // NOTE: register 0x05 is NOT read as an overflow counter here, and an earlier revision was wrong
+        // to do so. Instrumented on hardware over 465 service calls, its value equalled the available
+        // sample count (wr - rd) on 98.5% of reads, while FIFO occupancy never exceeded 6 of 32 - a fill
+        // level at which overflow is impossible. Whatever this module returns there, it is not lost
+        // samples, and treating it as such produced a "continuous overflow" alarm that was pure artefact.
+        // The drain keeps up comfortably: ~5-6 samples per 200 ms service call against 32 of capacity.
+        uint8_t intStatus = 0;
+        if (readRegister(bus, address, MAX3010X_REG_INT_STATUS_1, &intStatus) && (intStatus & MAX3010X_INT_ALC_OVF)) {
+            // Ambient-light cancellation saturated: this window's PPG reflects the ALC railing rather than
+            // tissue. Reading the register clears the latched flag.
+            alcOverflowEvents++;
+        }
+
+#ifdef BHV_PPG_DIAG
+        // Log the raw FIFO pointers alongside the overflow counter. The open question is WHY
+        // OVF_COUNTER is non-zero on essentially every service call while heart rate stays stable:
+        // is the part outrunning the drain, or does available=(wr-rd)&0x1F alias a full FIFO to
+        // empty and stall? Those look identical from the counter alone but differ completely here.
+        {
+            uint8_t wp = 0, rp = 0, ov2 = 0;
+            readRegister(bus, address, MAX3010X_REG_FIFO_WRITE_POINTER, &wp);
+            readRegister(bus, address, MAX3010X_REG_FIFO_READ_POINTER, &rp);
+            readRegister(bus, address, MAX3010X_REG_OVF_COUNTER, &ov2);
+            LOG_INFO("FIFODIAG wr=%u rd=%u avail=%u reg05=%u slid=%u", wp, rp,
+                     (unsigned)((wp - rp) & MAX3010X_FIFO_POINTER_MASK), ov2, slidingSampleCount);
+        }
+#endif
+
+        const uint32_t nowMs = millis();
+        if (alcOverflowEvents && ((lastIntegrityLogMs == 0) || ((uint32_t)(nowMs - lastIntegrityLogMs) >= 5000))) {
+            lastIntegrityLogMs = nowMs;
+            LOG_WARN("MAX30102 integrity: alc_ovf_events=%u", alcOverflowEvents);
+        }
     }
 
     uint16_t ingested = 0;
@@ -626,6 +728,22 @@ uint32_t MAX30102Sensor::trimmedMeanOfWindow(const uint32_t *window, uint8_t cou
     return (uint32_t)((sum + (n / 2)) / n);
 }
 
+bool MAX30102Sensor::computePeriodicity(const uint32_t *ir, uint16_t count, float *bestRhoOut, uint16_t *bestLagOut) const
+{
+    // Implementation lives in PpgSignalQuality.h so the native test build can exercise the exact code the
+    // firmware runs; this file cannot be compiled on the host because the SparkFun library is an
+    // Arduino-targets-only dependency.
+    const ppg::Periodicity r =
+        ppg::bestPeriodicity(ir, count, AUTOCORR_MIN_LAG, AUTOCORR_MAX_LAG, AUTOCORR_MIN_OVERLAP, AUTOCORR_HARMONIC_TOLERANCE);
+    if (bestRhoOut) {
+        *bestRhoOut = r.bestRho;
+    }
+    if (bestLagOut) {
+        *bestLagOut = r.bestLag;
+    }
+    return r.found;
+}
+
 bool MAX30102Sensor::detectFingerPresence(const uint32_t *ir, const uint32_t *red, uint16_t count) const
 {
     if (!ir || !red || count == 0) {
@@ -669,6 +787,40 @@ bool MAX30102Sensor::detectFingerPresence(const uint32_t *ir, const uint32_t *re
         (meanIr > 0 && ((uint64_t)spanIr * 1000ULL) >= ((uint64_t)meanIr * MAX3010X_FINGER_PULSATILITY_PERMILLE)) ||
         (meanRed > 0 && ((uint64_t)spanRed * 1000ULL) >= ((uint64_t)meanRed * MAX3010X_FINGER_PULSATILITY_PERMILLE));
 
+    // Presence detection answers "is something on the sensor?", NOT "is this a pulse?".
+    //
+    // An earlier revision required pulsatility here (dcLevelOk && acLevelOk && pulsatilityOk) to stop
+    // noise being accepted as a finger. Measured on hardware, that rejected a real finger: a wearer at
+    // 193278 IR DC with 801 counts of AC sits at 0.414% pulsatility against the 0.4% threshold, and the
+    // red channel at ~0.28% is below it outright. Windows dipped under the bar intermittently, each dip
+    // incremented the no-finger streak, and the session was killed and restarted every ~6 s - seven times
+    // in a 45 s capture, with a heart rate never once reaching the display. Strictly worse than the bug
+    // it was meant to fix.
+    //
+    // The noise-rejection job belongs to the periodicity gate instead, which does it far better: measured
+    // best-autocorrelation is 0.97-0.99 on a real finger versus 0.227 on pure noise, against thresholds of
+    // 0.40 (HR) and 0.50 (SpO2). Noise now passes presence detection and is then refused downstream, which
+    // is the correct division of responsibility - a permissive "something is here" followed by a strict
+    // "and it repeats like a heartbeat".
+    //
+    // Pulsatility is therefore back to being one of two ways to satisfy the AC requirement, as originally
+    // written.
+    //
+    // acLevelOk is an absolute span in ADC counts (80 IR / 40 RED). Sensor noise alone clears it easily:
+    // over a 100-sample window, Gaussian noise of sigma s has a peak-to-peak span of roughly 5s, so
+    // s >= 30 LSB already exceeds 80 counts regardless of whether anything is touching the sensor. With
+    // the old `acLevelOk || pulsatilityOk`, that absolute test short-circuited the ratio test entirely,
+    // so a flat DC level plus noise - no cardiac component whatsoever - was accepted as a finger and fed
+    // to the kernel, which duly produced heart rates and SpO2 values. Replaying the shipping decision
+    // path on pure noise reproduced this: at sigma 80 on a 90000 DC, 100% of windows passed finger
+    // detection and roughly half of all evaluations put a fabricated number on the OLED.
+    //
+    // MAX3010X_FINGER_PULSATILITY_PERMILLE (0.4%) was already defined and already correct; it was simply
+    // bypassed. Requiring it narrows the fabrication band substantially - it removes the whole low-noise
+    // region, where apparent perfusion is 0.17-0.22% - but it does NOT close it completely, because at
+    // large noise amplitudes the apparent perfusion index also rises above 0.4%. Rejecting aperiodic
+    // noise outright needs the periodicity gate, which is a separate change; this is the cheap half that
+    // uses a constant the code already has.
     return dcLevelOk && (acLevelOk || pulsatilityOk);
 }
 
@@ -686,6 +838,8 @@ bool MAX30102Sensor::evaluateSlidingWindow(TwoWire *bus, uint8_t address)
     uint64_t sumRed = 0;
     uint32_t maxIr = 0;
     uint32_t maxRed = 0;
+    uint32_t minIr = 0xFFFFFFFFu;
+    uint32_t minRed = 0xFFFFFFFFu;
     for (uint16_t i = 0; i < MAX30102_BUFFER_LEN; ++i) {
         const uint32_t ir = irWindow[i];
         const uint32_t red = redWindow[i];
@@ -697,15 +851,67 @@ bool MAX30102Sensor::evaluateSlidingWindow(TwoWire *bus, uint8_t address)
         if (red > maxRed) {
             maxRed = red;
         }
+        if (ir < minIr) {
+            minIr = ir;
+        }
+        if (red < minRed) {
+            minRed = red;
+        }
     }
     const uint32_t meanIr = (uint32_t)(sumIr / MAX30102_BUFFER_LEN);
     const uint32_t meanRed = (uint32_t)(sumRed / MAX30102_BUFFER_LEN);
-    const bool belowPowerdownMeanThresholds =
-        (meanRed < MAX3010X_POWERDOWN_RED_MEAN_MAX) && (meanIr < MAX3010X_POWERDOWN_IR_MEAN_MAX);
     lastEvalMeanIr = meanIr;
     lastEvalMeanRed = meanRed;
 
     const bool fingerPresent = detectFingerPresence(irWindow, redWindow, MAX30102_BUFFER_LEN);
+#ifdef BHV_PPG_DIAG
+    // Unconditional: the normal "SpO2 input" line is downstream of the finger gate, so with nobody
+    // present the LED-drive sweep would log nothing at all.
+    //
+    // Also reports the window standard deviation in milli-counts. With no finger there is no cardiac
+    // component, so that IS the noise floor - which makes the datasheet noise budget (shot + quantisation)
+    // directly falsifiable rather than merely plausible, and lets the sqrt(I) shot-noise scaling be
+    // checked across the LED drive sweep.
+    {
+        double sIr = 0.0, sRed = 0.0;
+        for (uint16_t i = 0; i < MAX30102_BUFFER_LEN; ++i) {
+            const double di = (double)irWindow[i] - (double)meanIr;
+            const double dr = (double)redWindow[i] - (double)meanRed;
+            sIr += di * di;
+            sRed += dr * dr;
+        }
+        const uint32_t sdIrmc = (uint32_t)(sqrt(sIr / MAX30102_BUFFER_LEN) * 1000.0);
+        const uint32_t sdRedmc = (uint32_t)(sqrt(sRed / MAX30102_BUFFER_LEN) * 1000.0);
+        LOG_INFO("DCDIAG drive=0x%02X mean_ir=%u mean_red=%u max_ir=%u sd_ir_mc=%u sd_red_mc=%u finger=%d",
+                 max30102ActiveLedPower, meanIr, meanRed, maxIr, sdIrmc, sdRedmc, fingerPresent ? 1 : 0);
+    }
+#endif
+
+    // Anchor this epoch's reference DC on the first evaluation that actually sees a finger, then judge
+    // "the finger has left" relative to that anchor rather than against a fixed count. Optical coupling
+    // varies by more than an order of magnitude across wearers, so an absolute bar silently excludes
+    // whole populations (see MAX3010X_POWERDOWN_DC_FRACTION_PERCENT).
+    if (fingerPresent && epochAnchorCount < MAX3010X_EPOCH_ANCHOR_SAMPLES) {
+        epochAnchorSamples[epochAnchorCount++] = meanIr;
+        // Re-derive from the median of what we have so far, so the anchor self-corrects as the contact
+        // settles instead of being fixed by an initial hard press.
+        activeEpochStartMeanIr = medianOfWindow(epochAnchorSamples, epochAnchorCount);
+        LOG_INFO("MAX30102 active epoch anchor: n=%u mean_ir=%u anchor=%u (collapse below %u)", epochAnchorCount, meanIr,
+                 activeEpochStartMeanIr,
+                 (uint32_t)((uint64_t)activeEpochStartMeanIr * MAX3010X_POWERDOWN_DC_FRACTION_PERCENT / 100ULL));
+    }
+    const bool signalCollapsed =
+        (activeEpochStartMeanIr != 0) &&
+        (meanIr < (uint32_t)((uint64_t)activeEpochStartMeanIr * MAX3010X_POWERDOWN_DC_FRACTION_PERCENT / 100ULL));
+
+    // A single bad window must not end a session; require a streak before giving up.
+    const bool measurementViable = fingerPresent && !signalCollapsed;
+    if (measurementViable) {
+        noFingerEvalStreak = 0;
+    } else if (noFingerEvalStreak < MAX3010X_NO_FINGER_EVAL_STREAK_FOR_SLEEP) {
+        noFingerEvalStreak++;
+    }
+    const bool giveUpOnEpoch = !measurementViable && (noFingerEvalStreak >= MAX3010X_NO_FINGER_EVAL_STREAK_FOR_SLEEP);
     const uint32_t nowMs = millis();
     if ((max30102PresenceStatsLastLogMs == 0) ||
         ((uint32_t)(nowMs - max30102PresenceStatsLastLogMs) >= MAX30102_PRESENCE_STATS_LOG_INTERVAL_MS)) {
@@ -713,36 +919,43 @@ bool MAX30102Sensor::evaluateSlidingWindow(TwoWire *bus, uint8_t address)
         LOG_INFO("MAX30102 presence stats(active): present=%d mean_ir=%u mean_red=%u max_ir=%u max_red=%u n=%u", fingerPresent, meanIr,
                  meanRed, maxIr, maxRed, MAX30102_BUFFER_LEN);
     }
-    if (!fingerPresent) {
+    if (!measurementViable) {
         resetStabilityState();
         clearRawWaveformCache();
 
-        concurrency::LockGuard g(&metricsLock);
-        hasEvaluatedWindow = true;
-        cachedFingerPresent = false;
-        cachedHasHeartRate = false;
-        cachedHeartRate = 0;
-        cachedHasSpO2 = false;
-        cachedSpO2 = 0;
-        cachedHasTemperature = false;
-        cachedTemperatureC = 0.0f;
-        latchedHasHeartRate = false;
-        latchedHeartRate = 0;
-        latchedHasSpO2 = false;
-        latchedSpO2 = 0;
-        latchedHasTemperature = false;
-        latchedTemperatureC = 0.0f;
-        lastStableHeartMs = 0;
-        lastStableSpO2Ms = 0;
-        lastStableTempMs = 0;
-        hasHeartEma = false;
-        heartEma = 0.0f;
-        hasHeartOutputEma = false;
-        heartOutputEma = 0.0f;
-        if (!keepAwake && chipType == PulseOxChipType::MAX30102 && max30102PresenceTriggeredActive) {
+        {
+            concurrency::LockGuard g(&metricsLock);
+            hasEvaluatedWindow = true;
+            cachedFingerPresent = false;
+            cachedHasHeartRate = false;
+            cachedHeartRate = 0;
+            cachedHasSpO2 = false;
+            cachedSpO2 = 0;
+            cachedHasDieTempC = false;
+            cachedDieTempC = 0.0f;
+            latchedHasHeartRate = false;
+            latchedHeartRate = 0;
+            latchedHasSpO2 = false;
+            latchedSpO2 = 0;
+            latchedHasDieTempC = false;
+            latchedDieTempC = 0.0f;
+            lastStableHeartMs = 0;
+            lastStableSpO2Ms = 0;
+            lastStableTempMs = 0;
+            hasHeartEma = false;
+            heartEma = 0.0f;
+            hasHeartOutputEma = false;
+            heartOutputEma = 0.0f;
+        }
+        // metricsLock is released above on purpose: sleep() performs I2C traffic and must not run while
+        // the metrics mutex is held.
+        if (giveUpOnEpoch && !keepAwake && chipType == PulseOxChipType::MAX30102 && max30102PresenceTriggeredActive) {
             max30102PresenceTriggeredActive = false;
-            LOG_INFO("MAX30102 no finger in active eval, sleeping sensor (next scan in %ums)",
-                     MAX30102_PRESENCE_SCAN_INTERVAL_MS);
+            activeEpochStartMeanIr = 0;
+            epochAnchorCount = 0;
+            noFingerEvalStreak = 0;
+            LOG_INFO("MAX30102 no finger in active eval (mean_ir=%u collapsed=%d), sleeping sensor (next scan in %ums)",
+                     meanIr, signalCollapsed, MAX30102_PRESENCE_SCAN_INTERVAL_MS);
             sleep();
             max30102PresenceScanWakeStartedMs = 0;
             max30102PresenceScanNextWakeMs = millis() + MAX30102_PRESENCE_SCAN_INTERVAL_MS;
@@ -762,10 +975,40 @@ bool MAX30102Sensor::evaluateSlidingWindow(TwoWire *bus, uint8_t address)
     int8_t selectedHeartRateValid = 0;
     maxim_heart_rate_and_oxygen_saturation(irWindow, MAX30102_BUFFER_LEN, redWindow, &spo2, &spo2_valid, &selectedHeartRate,
                                            &selectedHeartRateValid);
+    // Periodicity. A heartbeat's distinguishing property is that it repeats, not that it is large; no
+    // amplitude threshold separates a pulse from noise (see HR_MIN_AUTOCORR).
+    float bestRho = -2.0f;
+    uint16_t bestLag = 0;
+    const bool periodic = computePeriodicity(irWindow, MAX30102_BUFFER_LEN, &bestRho, &bestLag);
+    const bool hrPeriodicOk = periodic && (bestRho >= HR_MIN_AUTOCORR);
+    const bool spo2PeriodicOk = periodic && (bestRho >= SPO2_MIN_AUTOCORR);
+    // At 25 Hz effective sample rate, BPM = 60 * 25 / lag.
+    const uint32_t autocorrBpm = ppg::bpmFromLag(bestLag, MAX3010X_EFFECTIVE_SAMPLE_RATE_HZ);
+
     bool hrValueValid = ((selectedHeartRateValid != 0) && (selectedHeartRate >= (int32_t)HEART_RATE_MIN_VALID) &&
-                         (selectedHeartRate <= (int32_t)HEART_RATE_MAX_VALID));
+                         (selectedHeartRate <= (int32_t)HEART_RATE_MAX_VALID) && hrPeriodicOk);
+
+    // For SpO2, also require the periodicity lag to agree with the rate the kernel reported. Two
+    // independent estimators landing on the same interval is much stronger evidence than either alone,
+    // and it is cheap.
+    const bool lagAgreesWithHr =
+        (selectedHeartRate > 0) &&
+        ppg::ratesAgree(autocorrBpm, (uint32_t)selectedHeartRate, SPO2_LAG_HR_TOLERANCE_PERCENT);
+    // Red-channel integrity. A failed RED channel drives the ratio toward zero, which the vendor table
+    // maps to a reassuring 96-97% (see SPO2_RED_PI_MIN_PERMYRIAD). Require that red actually carries a
+    // pulsatile component, and that the ratio is above the region where the table folds back.
+    const uint32_t acIr = (maxIr > minIr) ? (maxIr - minIr) : 0;
+    const uint32_t acRed = (maxRed > minRed) ? (maxRed - minRed) : 0;
+    const bool redPerfusionOk =
+        (meanRed > 0) && (((uint64_t)acRed * 10000ULL) >= ((uint64_t)meanRed * SPO2_RED_PI_MIN_PERMYRIAD));
+    const bool spo2RatioOk = (acIr > 0) && (meanRed > 0) && (((uint64_t)acRed * (uint64_t)meanIr * 100ULL) >=
+                                                             ((uint64_t)acIr * (uint64_t)meanRed * SPO2_MIN_R_PERCENT));
+    const bool redChannelOk =
+        ppg::redChannelUsable(acIr, meanIr, acRed, meanRed, SPO2_RED_PI_MIN_PERMYRIAD, SPO2_MIN_R_PERCENT);
+
     bool spo2ValueValid = (spo2_valid != 0) && (spo2 != SPO2_INVALID_SENTINEL) &&
-                          (spo2 >= (int32_t)SPO2_MIN_VALID) && (spo2 <= (int32_t)SPO2_MAX_VALID);
+                          (spo2 >= (int32_t)SPO2_MIN_VALID) && (spo2 <= (int32_t)SPO2_MAX_VALID) && redChannelOk &&
+                          spo2PeriodicOk && lagAgreesWithHr;
 
     if (hrValueValid) {
         pushStabilitySample((uint32_t)selectedHeartRate, hrStabilityWindow, &hrStabilityCount, &hrStabilityIndex);
@@ -810,7 +1053,10 @@ bool MAX30102Sensor::evaluateSlidingWindow(TwoWire *bus, uint8_t address)
     uint32_t smoothedHeart = filteredHeart;
     concurrency::LockGuard g(&metricsLock);
     hasEvaluatedWindow = true;
-    cachedFingerPresent = !belowPowerdownMeanThresholds;
+    // Report the finger state we actually determined. This used to be `!belowPowerdownMeanThresholds`,
+    // a second and far stricter definition of "present" that contradicted detectFingerPresence() above
+    // and caused the downshift gate to sleep the sensor mid-measurement for most wearers.
+    cachedFingerPresent = measurementViable;
 
     if (stableHeart) {
         if (!hasHeartEma) {
@@ -845,15 +1091,21 @@ bool MAX30102Sensor::evaluateSlidingWindow(TwoWire *bus, uint8_t address)
         latchedHasSpO2 = true;
         latchedSpO2 = filteredSpO2;
         lastStableSpO2Ms = nowMsEval;
-    } else if (spo2ValueValid) {
-        // Latch valid-but-not-stable SpO2 so UI can show it (hold for STABLE_VALUE_HOLD_MS)
-        latchedHasSpO2 = true;
-        latchedSpO2 = (uint32_t)spo2;
-        lastStableSpO2Ms = nowMsEval;
     }
+    // A valid-but-UNSTABLE SpO2 deliberately does NOT refresh the cache or its timestamp.
+    //
+    // This branch used to latch the raw value and stamp lastStableSpO2Ms, which made spo2HoldValid true
+    // continuously and so bypassed the stability gate entirely: "stable" then chose only between the
+    // median and the raw value, never between showing a number and showing none. Observed on real
+    // hardware, a finger sliding off the sensor produced "SpO2 98%, stable" while the heart-rate
+    // estimator behind it was swinging between 33 and 214 bpm.
+    //
+    // The hold exists to bridge brief instability in an otherwise good measurement. It is not a licence
+    // to keep displaying a number once the evidence for it has gone, so only a stable, quality-gated
+    // result may create or refresh the cache.
     if (tempValid && stableHeart) {
-        latchedHasTemperature = true;
-        latchedTemperatureC = tempC;
+        latchedHasDieTempC = true;
+        latchedDieTempC = tempC;
         lastStableTempMs = nowMsEval;
     }
 
@@ -862,7 +1114,7 @@ bool MAX30102Sensor::evaluateSlidingWindow(TwoWire *bus, uint8_t address)
     const bool spo2HoldValid =
         latchedHasSpO2 && lastStableSpO2Ms != 0 && (uint32_t)(nowMsEval - lastStableSpO2Ms) <= STABLE_VALUE_HOLD_MS;
     const bool tempHoldValid =
-        latchedHasTemperature && lastStableTempMs != 0 && (uint32_t)(nowMsEval - lastStableTempMs) <= STABLE_VALUE_HOLD_MS;
+        latchedHasDieTempC && lastStableTempMs != 0 && (uint32_t)(nowMsEval - lastStableTempMs) <= STABLE_VALUE_HOLD_MS;
 
     outputHasHeart = stableHeart || heartHoldValid;
     outputHeart = stableHeart ? smoothedHeart : (heartHoldValid ? latchedHeartRate : 0);
@@ -872,20 +1124,23 @@ bool MAX30102Sensor::evaluateSlidingWindow(TwoWire *bus, uint8_t address)
     outputSpO2 = stableSpO2 ? filteredSpO2 : (spo2HoldValid ? latchedSpO2 : 0);
 
     outputHasTemp = (tempValid && stableHeart) || tempHoldValid;
-    outputTempC = (tempValid && stableHeart) ? tempC : (tempHoldValid ? latchedTemperatureC : 0.0f);
+    outputTempC = (tempValid && stableHeart) ? tempC : (tempHoldValid ? latchedDieTempC : 0.0f);
 
     cachedHasHeartRate = outputHasHeart;
     cachedHeartRate = outputHeart;
     cachedHasSpO2 = outputHasSpO2;
     cachedSpO2 = outputSpO2;
-    cachedHasTemperature = outputHasTemp;
-    cachedTemperatureC = outputTempC;
+    cachedHasDieTempC = outputHasTemp;
+    cachedDieTempC = outputTempC;
 
     const bool usedSpO2Hold = !stableSpO2 && spo2HoldValid;
-    LOG_INFO("HR eval: hr=%d valid=%d stable=%d hr_window_count=%u step=%u hr_out=%u hold=%d", selectedHeartRate, hrValueValid,
-             stableHeart, hrStabilityCount, MAX3010X_SLIDING_STEP, outputHeart, usedHeartHold);
-    LOG_INFO("SpO2 eval: spo2=%d valid=%d stable=%d spo2_window_count=%u spo2_out=%u hold=%d", (int)spo2, spo2ValueValid ? 1 : 0,
-             stableSpO2 ? 1 : 0, spo2StabilityCount, outputSpO2, usedSpO2Hold ? 1 : 0);
+    LOG_INFO("HR eval: hr=%d valid=%d stable=%d hr_window_count=%u step=%u hr_out=%u hold=%d rho=%.2f lag=%u ac_bpm=%u",
+             selectedHeartRate, hrValueValid, stableHeart, hrStabilityCount, MAX3010X_SLIDING_STEP, outputHeart,
+             usedHeartHold, (double)bestRho, bestLag, autocorrBpm);
+    LOG_INFO("SpO2 eval: spo2=%d valid=%d stable=%d spo2_window_count=%u spo2_out=%u hold=%d red_pi_ok=%d ratio_ok=%d "
+             "ac_ir=%u ac_red=%u",
+             (int)spo2, spo2ValueValid ? 1 : 0, stableSpO2 ? 1 : 0, spo2StabilityCount, outputSpO2, usedSpO2Hold ? 1 : 0,
+             redPerfusionOk ? 1 : 0, spo2RatioOk ? 1 : 0, acIr, acRed);
     return true;
 }
 
@@ -1231,6 +1486,51 @@ bool MAX30102Sensor::serviceSensor()
         configureMAX30102Profile(false);
     }
 
+#ifdef BHV_PPG_DIAG_ADCSWEEP
+    // Sweep the ADC full-scale range at FIXED LED drive. If the measured noise floor stays constant in
+    // COUNTS it is output-referred (digital/quantisation-like); if it stays constant in PICOAMPS it is
+    // input-referred (analog front-end). That decides whether range and drive can be traded for SNR.
+    {
+        static const int kRanges[] = {2048, 4096, 8192, 16384};
+        static uint8_t rIdx = 0;
+        static uint32_t lastRangeMs = 0;
+        const uint32_t nowR = millis();
+        if (lastRangeMs == 0) { lastRangeMs = nowR; }
+        if ((uint32_t)(nowR - lastRangeMs) >= BHV_PPG_DIAG_ADCSWEEP) {
+            lastRangeMs = nowR;
+            rIdx = (uint8_t)((rIdx + 1) % 4);
+            // Register values are private to the vendor .cpp; SPO2_CONFIG[6:5] per the datasheet.
+            static const uint8_t kRangeBits[] = {0x00, 0x20, 0x40, 0x60};
+            max30102.setADCRange(kRangeBits[rIdx]);
+            discardSampleWindow();
+            LOG_INFO("ADCSWEEP range=%d nA", kRanges[rIdx]);
+        }
+    }
+#endif
+
+#ifdef BHV_PPG_DIAG_LEDSWEEP
+    // With NO finger, mean_ir vs LED drive decomposes the optical pedestal: the intercept is ambient
+    // plus dark current (independent of drive), the slope is light returning from the enclosure/air
+    // without traversing tissue. Neither needs a person present.
+    {
+        static const uint8_t kSweep[] = {0x00, 0x08, 0x10, 0x18, 0x20, 0x2F, 0x40, 0x5F, 0x7F};
+        static uint8_t sweepIdx = 0;
+        static uint32_t lastSweepMs = 0;
+        const uint32_t nowSweep = millis();
+        if (lastSweepMs == 0) { lastSweepMs = nowSweep; }
+        if ((uint32_t)(nowSweep - lastSweepMs) >= BHV_PPG_DIAG_LEDSWEEP) {
+            lastSweepMs = nowSweep;
+            sweepIdx = (uint8_t)((sweepIdx + 1) % (sizeof(kSweep) / sizeof(kSweep[0])));
+            max30102ActiveLedPower = kSweep[sweepIdx];
+            max30102.setPulseAmplitudeRed(max30102ActiveLedPower);
+            max30102.setPulseAmplitudeIR(max30102ActiveLedPower);
+            discardSampleWindow();
+            LOG_INFO("LEDSWEEP drive=0x%02X (%u x 0.2mA = %u.%u mA)", max30102ActiveLedPower,
+                     max30102ActiveLedPower, (max30102ActiveLedPower * 2) / 10, (max30102ActiveLedPower * 2) % 10);
+        }
+    }
+#endif
+
     if (chipType == PulseOxChipType::MAX30102) {
         ingestMAX30102Fifo(bus, address);
     } else if (chipType == PulseOxChipType::MAX30100) {
@@ -1266,17 +1566,19 @@ bool MAX30102Sensor::serviceSensor()
 
         const uint32_t nowMs = millis();
         const bool holdElapsed = (uint32_t)(nowMs - max30102PresenceActiveSinceMs) >= MAX30102_PRESENCE_ACTIVE_HOLD_MS;
-        const bool belowPowerdownMeanThresholds =
-            (lastEvalMeanRed < MAX3010X_POWERDOWN_RED_MEAN_MAX) && (lastEvalMeanIr < MAX3010X_POWERDOWN_IR_MEAN_MAX);
+        const bool streakReached = noFingerEvalStreak >= MAX3010X_NO_FINGER_EVAL_STREAK_FOR_SLEEP;
         if ((lastDownshiftGateLogMs == 0) || ((uint32_t)(nowMs - lastDownshiftGateLogMs) >= 1000)) {
             lastDownshiftGateLogMs = nowMs;
-            LOG_INFO(
-                "MAX30102 downshift gate: hold=%d hasWindow=%d finger=%d mean_ir=%u mean_red=%u below=%d active=%d mode=%s", holdElapsed,
-                hasWindow, fingerPresent, lastEvalMeanIr, lastEvalMeanRed, belowPowerdownMeanThresholds, max30102PresenceTriggeredActive,
-                max30102PresenceMode ? "presence" : "active");
+            LOG_INFO("MAX30102 downshift gate: hold=%d hasWindow=%d finger=%d mean_ir=%u mean_red=%u anchor=%u streak=%u "
+                     "active=%d mode=%s",
+                     holdElapsed, hasWindow, fingerPresent, lastEvalMeanIr, lastEvalMeanRed, activeEpochStartMeanIr,
+                     noFingerEvalStreak, max30102PresenceTriggeredActive, max30102PresenceMode ? "presence" : "active");
         }
-        if (holdElapsed && hasWindow && !fingerPresent) {
+        if (holdElapsed && hasWindow && !fingerPresent && streakReached) {
             max30102PresenceTriggeredActive = false;
+            activeEpochStartMeanIr = 0;
+            epochAnchorCount = 0;
+            noFingerEvalStreak = 0;
             LOG_INFO("MAX30102 no finger, entering sleep presence-scan mode");
             sleep();
             max30102PresenceScanWakeStartedMs = 0;
@@ -1296,10 +1598,8 @@ bool MAX30102Sensor::getMetrics(meshtastic_Telemetry *measurement)
     bool localHasEvaluatedWindow = false;
     bool localHasHeartRate = false;
     bool localHasSpO2 = false;
-    bool localHasTemperature = false;
     uint32_t localHeartRate = 0;
     uint32_t localSpO2 = 0;
-    float localTempC = 0.0f;
 
     {
         concurrency::LockGuard g(&metricsLock);
@@ -1308,11 +1608,20 @@ bool MAX30102Sensor::getMetrics(meshtastic_Telemetry *measurement)
         localHeartRate = cachedHeartRate;
         localHasSpO2 = cachedHasSpO2;
         localSpO2 = cachedSpO2;
-        localHasTemperature = cachedHasTemperature;
-        localTempC = cachedTemperatureC;
     }
 
     if (!localHasEvaluatedWindow) {
+        return false;
+    }
+
+    // Nothing worth reporting is not the same as a reading of zero.
+    //
+    // hasEvaluatedWindow only means "a window has been processed at some point", so with honest gating
+    // active - which withholds far more often than the original always-show behaviour - this returned
+    // true with every field absent. Callers treat a true return as "there is a measurement", and the
+    // result went out on the wire as `temperature=0.000000, heart_bpm=0, spO2=0`: a packet asserting a
+    // heart rate of zero, observed in real capture. Report nothing rather than nothing-shaped-as-zero.
+    if (!localHasHeartRate && !localHasSpO2) {
         return false;
     }
 
@@ -1329,10 +1638,14 @@ bool MAX30102Sensor::getMetrics(meshtastic_Telemetry *measurement)
         measurement->variant.health_metrics.spO2 = localSpO2;
     }
 
-    measurement->variant.health_metrics.has_temperature = localHasTemperature;
-    if (localHasTemperature) {
-        measurement->variant.health_metrics.temperature = localTempC;
-    }
+    // The MAX3010x has only a DIE-temperature sensor, whose documented purpose is compensating the
+    // temperature dependence of the SpO2 subsystem (the red LED's wavelength shifts with temperature).
+    // meshtastic_HealthMetrics.temperature is documented as "Body temperature in degrees Celsius"
+    // (protobufs/meshtastic/telemetry.proto), and it leaves this badge over LoRa and MQTT into
+    // third-party clients that will render it as exactly that. A package temperature is not a body
+    // temperature, so this sensor never populates the field; it belongs solely to the MLX90614 object
+    // temperature. The die reading is retained internally for diagnostics and future R compensation.
+    measurement->variant.health_metrics.has_temperature = false;
 
     return true;
 }

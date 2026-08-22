@@ -87,7 +87,47 @@ class HeartbeatPixelThread : private concurrency::OSThread
     static constexpr uint8_t kCountPerStrip = HEARTBEAT_NEOPIXEL_COUNT_PER_STRIP;
     static constexpr uint8_t kLedCount = kCountPerStrip * 2;
     static constexpr uint32_t kAnimationIntervalMs = 25;
+    /**
+     * Global LED brightness scale. This is SUPPLY-LIMITED, not an aesthetic choice - do not raise it.
+     *
+     * The +5VL rail comes from a TPS61040 (U1) running in DCM peak-current PFM off Vext through D15.
+     * Its deliverable output current is only about 105 mA typical and roughly 57 mA on a low battery -
+     * far below the ~840 mA a naive "14 x 60 mA" reading of the WS2812B datasheet suggests, because the
+     * boost simply cannot source it.
+     *
+     * At 0.35 with the default single-colour-channel patterns the animation peaks near 55 mA, which
+     * already leaves only a few percent of margin on a low battery. Raising this scale, or selecting a
+     * white preset (all three channels lit), pushes demand past what the boost can supply; +5VL then
+     * collapses on animation peaks, the chain browns out below the WS2812B's 3.5 V minimum, and the
+     * symptom looks like a firmware bug because it tracks the animation rate.
+     *
+     * A per-frame current budget in applyFrame() would make bright presets safe by scaling them down
+     * instead of browning out; until that exists, this constant is the only thing holding the line.
+     */
     static constexpr float kOutputScale = 0.35f;
+
+    /*
+     * Supply-limited current budget for the whole LED frame.
+     *
+     * +5VL comes from a TPS61040 in DCM peak-current PFM. SPICE modelling of the extracted topology
+     * (Vext-D15 -> L1 -> D16 -> C3, Q2 high-side to +5VL) puts the maximum sustainable load before the
+     * rail falls below the WS2812B's 3.5 V minimum at:
+     *
+     *     VBAT 4.2  Ipk 550mA -> 203 mA        VBAT 3.7  Ipk 400mA -> 130 mA
+     *     VBAT 3.4  Ipk 400mA -> 119 mA        VBAT 3.0  Ipk 250mA ->  67 mA   <- worst corner
+     *
+     * The shipped animation peaks near 55 mA, leaving only 1.21x headroom in that worst corner. The
+     * user-selectable white preset draws ~137 mA and browns the rail out in every corner except a full
+     * battery with a best-case part - simulated sag 1.06 V at nominal.
+     *
+     * So the frame current is capped rather than left to collapse the supply: a frame that would exceed
+     * the budget is scaled down uniformly, which makes bright presets legal-but-dimmer instead of
+     * rail-collapsing. 55 mA keeps ~20% margin below the 67 mA worst corner.
+     */
+    static constexpr uint16_t kFrameCurrentBudgetMilliAmps = 55;
+    /** WS2812B: ~20 mA per colour channel at full PWM, plus ~1 mA quiescent per device. */
+    static constexpr float kMilliAmpsPerChannelFull = 20.0f;
+    static constexpr float kQuiescentMilliAmpsPerLed = 1.0f;
     static constexpr uint16_t kStartupBpm = 80;
     static constexpr uint32_t kStartupDurationMs = 1100;
     static constexpr uint8_t kNotificationQueueSize = 8;
@@ -166,6 +206,11 @@ class HeartbeatPixelThread : private concurrency::OSThread
     void syncBpm(uint32_t nowMs);
     void setPixel(uint8_t index, const RgbColor &color, float brightness);
     void encodePixel(uint8_t index, uint8_t red, uint8_t green, uint8_t blue);
+    /** Running sum of PWM codes for the frame being built, used for the supply current budget. */
+    uint32_t frameCodeSum = 0;
+    /** Scale applied to the NEXT frame if the last one exceeded the budget; 1.0 = unrestricted. */
+    float frameCurrentScale = 1.0f;
+    void updateFrameCurrentScale();
     static void encodeByteToRmt(uint8_t value, rmt_data_t *dest);
     static RgbColor colorFromHex(uint32_t color);
     void showStrips();

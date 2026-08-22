@@ -85,6 +85,32 @@ int32_t HeartbeatPixelThread::runOnce()
         nextFrameMs = nowMs;
     }
 
+#ifdef BHV_LED_CROSSTALK_TEST
+    // DIAGNOSTIC BUILD ONLY - not compiled unless -D BHV_LED_CROSSTALK_TEST is set.
+    //
+    // Alternates the whole LED rail via ENABLE_VLED so the optical leak from the 14 WS2812Bs into the
+    // MAX30102 photodiode can be measured by differencing, instead of argued about. With no finger on
+    // the sensor the presence-mode log already reports mean_ir/mean_red every scan, so bucketing those
+    // by rail state gives leak_ir and leak_red directly. No finger, and no user, required.
+    {
+        static uint32_t lastToggleMs = 0;
+        static bool railOn = true;
+        if (lastToggleMs == 0) {
+            lastToggleMs = nowMs;
+        }
+        if ((uint32_t)(nowMs - lastToggleMs) >= BHV_LED_CROSSTALK_PERIOD_MS) {
+            lastToggleMs = nowMs;
+            railOn = !railOn;
+            powerStrips(railOn);
+            LOG_INFO("LEDRAIL %s", railOn ? "ON" : "OFF");
+        }
+        if (!railOn) {
+            // Rail is down; skip rendering so nothing is clocked into an unpowered chain.
+            return kAnimationIntervalMs;
+        }
+    }
+#endif
+
     if (runningStartup) {
         renderStartupFrame(nowMs);
         if ((nowMs - startupStartMs) >= kStartupDurationMs) {
@@ -658,10 +684,38 @@ HeartbeatPixelThread::RgbColor HeartbeatPixelThread::colorFromHex(uint32_t color
 void HeartbeatPixelThread::setPixel(uint8_t index, const RgbColor &color, float brightness)
 {
     const float scaledBrightness = kPixelMinBrightness[index] + (brightness * kPixelBrightnessRange[index]);
-    const uint8_t red = (uint8_t)roundf((float)color.red * kOutputScale * scaledBrightness);
-    const uint8_t green = (uint8_t)roundf((float)color.green * kOutputScale * scaledBrightness);
-    const uint8_t blue = (uint8_t)roundf((float)color.blue * kOutputScale * scaledBrightness);
+    // frameCurrentScale throttles the NEXT frame when the previous one exceeded what the boost can
+    // supply. Applying it one frame late costs a single animation tick (kAnimationIntervalMs) and avoids
+    // buffering the whole frame to measure it, which is not worth the RAM on this part.
+    const float gain = kOutputScale * scaledBrightness * frameCurrentScale;
+    const uint8_t red = (uint8_t)roundf((float)color.red * gain);
+    const uint8_t green = (uint8_t)roundf((float)color.green * gain);
+    const uint8_t blue = (uint8_t)roundf((float)color.blue * gain);
     encodePixel(index, red, green, blue);
+}
+
+void HeartbeatPixelThread::updateFrameCurrentScale()
+{
+    // Convert the frame's summed PWM codes into an estimated supply current, and derive the scale for the
+    // next frame. See kFrameCurrentBudgetMilliAmps for the SPICE-derived limits this protects.
+    const float mA = ((float)frameCodeSum / 255.0f) * kMilliAmpsPerChannelFull +
+                     (float)kLedCount * kQuiescentMilliAmpsPerLed;
+    if (mA > (float)kFrameCurrentBudgetMilliAmps) {
+        const float headroom = (float)kFrameCurrentBudgetMilliAmps - (float)kLedCount * kQuiescentMilliAmpsPerLed;
+        const float lit = mA - (float)kLedCount * kQuiescentMilliAmpsPerLed;
+        float next = (headroom > 0.0f && lit > 0.0f) ? (headroom / lit) : 1.0f;
+        // Ease toward the target rather than stepping, so a bright frame does not visibly flicker.
+        frameCurrentScale = (frameCurrentScale * 0.5f) + (next * 0.5f);
+        if (frameCurrentScale < 0.05f) {
+            frameCurrentScale = 0.05f;
+        }
+    } else if (frameCurrentScale < 1.0f) {
+        frameCurrentScale += 0.05f;
+        if (frameCurrentScale > 1.0f) {
+            frameCurrentScale = 1.0f;
+        }
+    }
+    frameCodeSum = 0;
 }
 
 void HeartbeatPixelThread::encodePixel(uint8_t index, uint8_t red, uint8_t green, uint8_t blue)
@@ -669,6 +723,8 @@ void HeartbeatPixelThread::encodePixel(uint8_t index, uint8_t red, uint8_t green
     if (index >= kLedCount) {
         return;
     }
+
+    frameCodeSum += (uint32_t)red + (uint32_t)green + (uint32_t)blue;
 
     rmt_data_t *pixel = &rmtFrame[index * kRmtItemsPerLed];
     encodeByteToRmt(green, pixel + (0 * kRmtItemsPerByte));
@@ -689,6 +745,7 @@ void HeartbeatPixelThread::encodeByteToRmt(uint8_t value, rmt_data_t *dest)
 
 void HeartbeatPixelThread::showStrips()
 {
+    updateFrameCurrentScale();
     powerStrips(true);
     if (!rmtTx || !rmtWriteBlocking(rmtTx, rmtFrame, kLedCount * kRmtItemsPerLed)) {
         LOG_WARN("HeartbeatPixels failed to write RMT frame");
@@ -718,7 +775,32 @@ void HeartbeatPixelThread::powerStrips(bool on)
     }
     digitalWrite(HEARTBEAT_NEOPIXEL_POWER_PIN, on ? HIGH : LOW);
     if (on) {
-        delay(1); // Give the strip rail a moment to settle before the next pixel frame.
+        // Wait for +5VL to actually reach the WS2812B's 3.5 V minimum before clocking a frame at it.
+        //
+        // This used to be delay(1), which is not enough. The rail is a TPS61040 boost feeding C4 plus the
+        // board-wide +5VL pour through Q2, and C4's value is not specified anywhere in the hardware design
+        // (the schematic Value field is the literal library symbol name "C_Polarized" and the BOM matches),
+        // while its CP_Elec_8x10.5 footprint spans 100-470 uF. Ramp to 3.5 V is roughly 7 ms at 220 uF and
+        // ~11 ms at 470 uF; at 1 ms the rail is still around 0.6 V. Clocking WS2812B data into a chain
+        // whose supply is below spec gives wrong colours or dropped frames, and because it tracks the
+        // animation it reads as a firmware bug.
+        //
+        // 30 ms, not 12, and the difference came from simulating it rather than estimating.
+        //
+        // A SPICE model of the extracted topology - Vext-D15 -> L1 -> D16 -> C3, Q2 high-side into C4,
+        // with the converter represented by its DCM peak-current envelope - gives time-to-3.5 V of:
+        //
+        //     C4=100uF   2.8 - 4.3 ms      C4=330uF    9.0 - 13.6 ms
+        //     C4=220uF   6.0 - 9.2 ms      C4=470uF   12.8 - 19.3 ms
+        //
+        // across VBAT 4.2 down to 3.0. A 500-run Monte Carlo over the datasheet peak-current spread
+        // (250-550 mA), L1 +-20%, C4 across its whole unspecified range and VBAT 3.0-4.2 puts
+        // P(rail not ready at 12 ms) at 29.2%, at 25 ms at 0.2%, and at 30 ms at 0.0%.
+        //
+        // The dominant uncertainty is C4, whose value is not specified anywhere in the hardware design.
+        // If it is ever pinned down this can be tightened; until then the delay has to cover the whole
+        // footprint range. It runs only on power-state transitions, never at frame cadence.
+        delay(30);
     }
 #else
     (void)on;

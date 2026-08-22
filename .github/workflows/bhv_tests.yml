@@ -1,0 +1,63 @@
+# BHV fork tests
+#
+# Every unit-test job inherited from upstream is gated on
+# `github.repository == 'meshtastic/firmware'` (main_matrix.yml:128, tests.yml:15/19,
+# pr_tests.yml:25), so none of them has ever executed on this fork. That means the
+# pulse-ox regression tests would silently never run - which is the same class of
+# problem as the sensor bugs they exist to catch.
+#
+# This workflow is deliberately ADDITIVE: it does not modify any upstream-owned
+# workflow file, so it cannot conflict when rebasing onto upstream develop.
+
+name: BHV Fork Tests
+
+on:
+  push:
+    branches:
+      - develop
+      - "fix/**"
+      - "feat/**"
+      - "ci/**"
+  pull_request:
+    branches:
+      - develop
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  native-tests:
+    name: PlatformIO native tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup native build
+        uses: ./.github/actions/setup-native
+
+      - name: Run PlatformIO tests
+        run: platformio test -e coverage -v --junit-output-path testreport.xml
+
+      - name: Save test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bhv-test-report
+          overwrite: true
+          path: ./testreport.xml
+
+  firmware-build:
+    name: Build heltec-v4-admin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup base
+        uses: ./.github/actions/setup-base
+
+      - name: Build firmware
+        run: platformio run -e heltec-v4-admin
