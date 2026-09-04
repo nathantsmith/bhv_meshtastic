@@ -8,6 +8,16 @@ This repository is a customized fork of the [Meshtastic firmware project](https:
   <img src="images/bhv-badge.png" alt="Biohacking Village badge showing its heart-rate display, battery, and LoRa antenna" width="520">
 </p>
 
+<p align="center"><strong>Sponsors</strong></p>
+
+<p align="center">
+  <a href="https://solasec.com/"><img src="images/sponsors/solasec.png" alt="SolaSec" height="90"></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.pcbway.com/"><img src="images/sponsors/pcbway.png" alt="PCBWay" height="55"></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.villageb.io/"><img src="images/sponsors/biohacking-village.png" alt="Biohacking Village" height="80"></a>
+</p>
+
 > **No cell service, Wi-Fi, or custom BHV app is required.** The badge communicates over LoRa and works with the standard Meshtastic apps.
 
 ## Get connected
